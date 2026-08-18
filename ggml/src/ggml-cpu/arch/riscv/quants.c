@@ -2059,6 +2059,92 @@ static NOINLINE void ggml_vec_dot_q4_K_q8_K_vl256(int n, float * GGML_RESTRICT s
 
     *s = sumf;
 }
+
+static NOINLINE void ggml_vec_dot_q4_K_q8_K_vl1024(int n, float * GGML_RESTRICT s, size_t bs, const void * GGML_RESTRICT vx, size_t bx, const void * GGML_RESTRICT vy, size_t by, int nrc) {
+    assert(n % QK_K == 0);
+    assert(nrc == 1);
+    UNUSED(nrc);
+    UNUSED(bx);
+    UNUSED(by);
+    UNUSED(bs);
+
+    const block_q4_K * GGML_RESTRICT x = vx;
+    const block_q8_K * GGML_RESTRICT y = vy;
+
+    const int nb = n / QK_K;
+
+    static const uint32_t kmask1 = 0x3f3f3f3f;
+    static const uint32_t kmask2 = 0x0f0f0f0f;
+    static const uint32_t kmask3 = 0x03030303;
+
+    uint32_t utmp[4];
+
+    const uint8_t * scales = (const uint8_t *) &utmp[0];
+    const uint8_t * mins   = (const uint8_t *) &utmp[2];
+
+    float sumf = 0;
+    for (int i = 0; i < nb; ++i) {
+        const float d    = y[i].d * GGML_CPU_FP16_TO_FP32(x[i].d);
+        const float dmin = y[i].d * GGML_CPU_FP16_TO_FP32(x[i].dmin);
+
+        memcpy(utmp, x[i].scales, 12);
+        utmp[3] = ((utmp[2] >> 4) & kmask2) | (((utmp[1] >> 6) & kmask3) << 4);
+        const uint32_t uaux = utmp[1] & kmask1;
+        utmp[1] = (utmp[2] & kmask2) | (((utmp[0] >> 6) & kmask3) << 4);
+        utmp[2] = uaux;
+        utmp[0] &= kmask1;
+
+        const size_t vl8 = 8;
+        const vint16mf2_t q8sums_0 = __riscv_vlse16_v_i16mf2(y[i].bsums, 4, vl8);
+        const vint16mf2_t q8sums_1 = __riscv_vlse16_v_i16mf2(y[i].bsums + 1, 4, vl8);
+        const vint16mf2_t q8sums = __riscv_vadd_vv_i16mf2(q8sums_0, q8sums_1, vl8);
+        const vuint8mf4_t mins8 = __riscv_vle8_v_u8mf4(mins, vl8);
+        const vint16mf2_t v_mins = __riscv_vreinterpret_v_u16mf2_i16mf2(
+                __riscv_vzext_vf2_u16mf2(mins8, vl8));
+        const vint32m1_t min_products = __riscv_vwmul_vv_i32m1(q8sums, v_mins, vl8);
+        const vint32m1_t min_sum = __riscv_vredsum_vs_i32m1_i32m1(
+                min_products, __riscv_vmv_v_x_i32m1(0, 1), vl8);
+        sumf -= dmin * __riscv_vmv_x_s_i32m1_i32(min_sum);
+
+        const uint8_t * GGML_RESTRICT q4 = x[i].qs;
+        const int8_t  * GGML_RESTRICT q8 = y[i].qs;
+        const size_t vl32 = 32;
+
+        // VLEN=1024 holds 32 i32 lanes in LMUL=1. Keep the eight Q4_K
+        // sub-block scales in the vector domain and perform one final i32
+        // reduction instead of eight i16 reductions and scalar rescalings.
+        vint32m1_t lower_acc = __riscv_vmv_v_x_i32m1(0, vl32);
+        vint32m1_t upper_acc = __riscv_vmv_v_x_i32m1(0, vl32);
+
+        for (int j = 0; j < QK_K / 64; ++j) {
+            const vuint8mf4_t packed = __riscv_vle8_v_u8mf4(q4, vl32);
+            const vint8mf4_t q4_lower = __riscv_vreinterpret_v_u8mf4_i8mf4(
+                    __riscv_vand_vx_u8mf4(packed, 0x0f, vl32));
+            const vint8mf4_t q4_upper = __riscv_vreinterpret_v_u8mf4_i8mf4(
+                    __riscv_vsrl_vx_u8mf4(packed, 4, vl32));
+
+            const vint16mf2_t lower_products = __riscv_vwmul_vv_i16mf2(
+                    q4_lower, __riscv_vle8_v_i8mf4(q8, vl32), vl32);
+            const vint16mf2_t upper_products = __riscv_vwmul_vv_i16mf2(
+                    q4_upper, __riscv_vle8_v_i8mf4(q8 + 32, vl32), vl32);
+
+            lower_acc = __riscv_vwmacc_vx_i32m1(
+                    lower_acc, scales[2 * j], lower_products, vl32);
+            upper_acc = __riscv_vwmacc_vx_i32m1(
+                    upper_acc, scales[2 * j + 1], upper_products, vl32);
+
+            q4 += 32;
+            q8 += 64;
+        }
+
+        const vint32m1_t dot_acc = __riscv_vadd_vv_i32m1(lower_acc, upper_acc, vl32);
+        const vint32m1_t dot_sum = __riscv_vredsum_vs_i32m1_i32m1(
+                dot_acc, __riscv_vmv_v_x_i32m1(0, 1), vl32);
+        sumf += d * __riscv_vmv_x_s_i32m1_i32(dot_sum);
+    }
+
+    *s = sumf;
+}
 #endif
 
 void ggml_vec_dot_q4_K_q8_K(int n, float * GGML_RESTRICT s, size_t bs, const void * GGML_RESTRICT vx, size_t bx, const void * GGML_RESTRICT vy, size_t by, int nrc) {
@@ -2069,7 +2155,10 @@ void ggml_vec_dot_q4_K_q8_K(int n, float * GGML_RESTRICT s, size_t bs, const voi
         case 128:
             ggml_vec_dot_q4_K_q8_K_vl128(n, s, bs, vx, bx, vy, by, nrc);
             break;
-        default: // 256 and above
+        case 1024:
+            ggml_vec_dot_q4_K_q8_K_vl1024(n, s, bs, vx, bx, vy, by, nrc);
+            break;
+        default: // 256, 512, and other widths
             ggml_vec_dot_q4_K_q8_K_vl256(n, s, bs, vx, bx, vy, by, nrc);
             break;
     }

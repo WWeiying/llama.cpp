@@ -56,6 +56,21 @@ struct block_q4_Kx16 {
 };
 
 static_assert(sizeof(block_q4_Kx16) == sizeof(ggml_half) * 32 + K_SCALE_SIZE * 16 + QK_K * 8, "wrong q4_K block size/padding");
+
+// Ara VLEN=1024 execution layout for 32 output rows. Metadata and packed
+// weights are transposed by source byte so one vector load observes the same
+// Q4_K field from all 32 rows. The layout deliberately remains byte-for-byte
+// the same size as 32 source blocks, which keeps the existing GGML repack
+// buffer allocation and tensor strides valid.
+struct block_q4_Kx32_ara {
+    ggml_half d[32];
+    ggml_half dmin[32];
+    uint8_t scales[K_SCALE_SIZE * 32];
+    uint8_t qs[(QK_K / 2) * 32];
+};
+
+static_assert(sizeof(block_q4_Kx32_ara) == sizeof(block_q4_K) * 32,
+              "wrong Ara q4_Kx32 block size/padding");
 struct block_q2_Kx8 {
     ggml_half d[8];      // super-block scale for quantized scales
     ggml_half dmin[8];   // super-block scale for quantized mins
@@ -137,6 +152,22 @@ static_assert(sizeof(block_mxfp4x8) == 8 + QK_MXFP4 * 4, "wrong mxfp4x8 block si
 extern "C" {
 #endif
 
+// Repack a row-major Q4_K matrix into block_q4_Kx32_ara tiles. The output
+// order is [row tile][K super-block], and n_per_row is measured in logical
+// Q4_K elements. This helper does not enable the optimized dispatch path.
+int ggml_repack_q4_K_32x1_ara(void * GGML_RESTRICT dst, size_t dst_size,
+                              const void * GGML_RESTRICT src, size_t src_size,
+                              int64_t nrows, int64_t n_per_row);
+
+// Ara's Q4_Kx32 path uses the standard Q8_K activation format for GEMV and
+// the existing four-row interleaved Q8_K format for the batched fallback.
+void ggml_gemv_q4_K_32x1_q8_K(int n, float * GGML_RESTRICT s, size_t bs,
+                              const void * GGML_RESTRICT vx, const void * GGML_RESTRICT vy,
+                              int nr, int nc);
+void ggml_gemm_q4_K_32x1_q8_K(int n, float * GGML_RESTRICT s, size_t bs,
+                              const void * GGML_RESTRICT vx, const void * GGML_RESTRICT vy,
+                              int nr, int nc);
+
 void ggml_quantize_mat_q8_0_4x4(const float * GGML_RESTRICT x, void * GGML_RESTRICT vy, int64_t k);
 void ggml_quantize_mat_q8_0_4x8(const float * GGML_RESTRICT x, void * GGML_RESTRICT vy, int64_t k);
 void ggml_quantize_mat_q8_K_4x4(const float * GGML_RESTRICT x, void * GGML_RESTRICT vy, int64_t k);
@@ -189,6 +220,13 @@ void ggml_gemm_q2_K_16x1_q8_K(int n, float * GGML_RESTRICT s, size_t bs, const v
 #endif
 
 // Native implementations
+void ggml_quantize_mat_q8_K_4x1_ara_generic(const float * GGML_RESTRICT x, void * GGML_RESTRICT vy, int64_t k);
+void ggml_gemv_q4_K_32x1_q8_K_generic(int n, float * GGML_RESTRICT s, size_t bs,
+                                      const void * GGML_RESTRICT vx, const void * GGML_RESTRICT vy,
+                                      int nr, int nc);
+void ggml_gemm_q4_K_32x1_q8_K_generic(int n, float * GGML_RESTRICT s, size_t bs,
+                                      const void * GGML_RESTRICT vx, const void * GGML_RESTRICT vy,
+                                      int nr, int nc);
 void ggml_quantize_mat_q8_0_4x4_generic(const float * GGML_RESTRICT x, void * GGML_RESTRICT vy, int64_t k);
 void ggml_quantize_mat_q8_0_4x8_generic(const float * GGML_RESTRICT x, void * GGML_RESTRICT vy, int64_t k);
 void ggml_quantize_mat_q8_K_4x4_generic(const float * GGML_RESTRICT x, void * GGML_RESTRICT vy, int64_t k);
@@ -227,7 +265,6 @@ void ggml_gemm_q8_0_4x4_q8_0_generic(int n, float * GGML_RESTRICT s, size_t bs, 
 void ggml_gemm_q8_0_4x8_q8_0_generic(int n, float * GGML_RESTRICT s, size_t bs, const void * GGML_RESTRICT vx, const void * GGML_RESTRICT vy, int nr, int nc);
 #if defined __riscv_zvfh
 void ggml_quantize_mat_q8_0_4x1_generic(const float * GGML_RESTRICT x, void * GGML_RESTRICT vy, int64_t k);
-void ggml_quantize_mat_q8_K_4x1_generic(const float * GGML_RESTRICT x, void * GGML_RESTRICT vy, int64_t k);
 void ggml_gemv_q4_0_16x1_q8_0_generic(int n, float * GGML_RESTRICT s, size_t bs, const void * GGML_RESTRICT vx, const void * GGML_RESTRICT vy, int nr, int nc);
 void ggml_gemv_q4_K_16x1_q8_K_generic(int n, float * GGML_RESTRICT s, size_t bs, const void * GGML_RESTRICT vx, const void * GGML_RESTRICT vy, int nr, int nc);
 void ggml_gemv_q8_0_16x1_q8_0_generic(int n, float * GGML_RESTRICT s, size_t bs, const void * GGML_RESTRICT vx, const void * GGML_RESTRICT vy, int nr, int nc);
