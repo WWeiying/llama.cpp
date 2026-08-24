@@ -441,6 +441,24 @@ function(ggml_add_cpu_backend_variant_impl tag_name)
             ggml-cpu/arch/riscv/quants.c
             ggml-cpu/arch/riscv/repack.cpp
             )
+        if (GGML_RISCV_QBS)
+            if (NOT GGML_RVV)
+                message(FATAL_ERROR "GGML_RISCV_QBS requires GGML_RVV")
+            endif()
+            if (NOT GGML_CPU_REPACK)
+                message(FATAL_ERROR "GGML_RISCV_QBS requires GGML_CPU_REPACK")
+            endif()
+            if (NOT EXISTS "${GGML_RISCV_QBS_INCLUDE_DIR}/qbs_abi.h")
+                message(FATAL_ERROR "GGML_RISCV_QBS_INCLUDE_DIR must contain qbs_abi.h")
+            endif()
+            target_compile_definitions(${GGML_CPU_NAME} PRIVATE GGML_USE_RISCV_QBS)
+            target_include_directories(${GGML_CPU_NAME} PRIVATE ${GGML_RISCV_QBS_INCLUDE_DIR})
+            list(APPEND GGML_CPU_SOURCES
+                ggml-cpu/arch/riscv/qbs.cpp
+                ggml-cpu/arch/riscv/qbs.h
+                ggml-cpu/arch/riscv/qbs-layout.h
+                )
+        endif()
         if (GGML_CPU_RISCV64_SPACEMIT)
             include(ggml-cpu/cmake/FindSMTIME.cmake)
             target_compile_definitions(${GGML_CPU_NAME} PRIVATE GGML_USE_CPU_RISCV64_SPACEMIT ${RISCV64_SPACEMIT_IME_SPEC})

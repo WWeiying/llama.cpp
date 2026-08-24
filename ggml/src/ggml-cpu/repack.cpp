@@ -11,6 +11,10 @@
 
 #include "arch-fallback.h"
 
+#if defined(GGML_USE_RISCV_QBS)
+#include "arch/riscv/qbs.h"
+#endif
+
 #include <cmath>
 #include <cstring>
 #include <cassert>
@@ -49,7 +53,6 @@ static inline int nearest_int(float fval) {
 
 extern "C" {
 
-#if defined __riscv_zvfh
 void ggml_quantize_mat_q8_0_4x1_generic(const float * GGML_RESTRICT x, void * GGML_RESTRICT vy, int64_t k) {
     assert(QK8_0 == 32);
     assert(k % QK8_0 == 0);
@@ -87,7 +90,6 @@ void ggml_quantize_mat_q8_0_4x1_generic(const float * GGML_RESTRICT x, void * GG
         }
     }
 }
-#endif
 
 void ggml_quantize_mat_q8_K_4x1_ara_generic(const float * GGML_RESTRICT x, void * GGML_RESTRICT vy, int64_t k) {
     assert(QK_K == 256);
@@ -339,11 +341,15 @@ template <> void ggml_quantize_mat_t<8, GGML_TYPE_Q8_K>(const float * GGML_RESTR
     ggml_quantize_mat_q8_K_4x8(x, vy, n_per_row);
 }
 
-#if defined __riscv_zvfh
+#if defined(__riscv_zvfh) || defined(GGML_USE_RISCV_QBS)
 template <> void ggml_quantize_mat_t<1, GGML_TYPE_Q8_0>(const float * GGML_RESTRICT x, void * GGML_RESTRICT vy, int64_t nrow, int64_t n_per_row) {
     assert(nrow == 4);
     UNUSED(nrow);
+#if defined __riscv_zvfh
     ggml_quantize_mat_q8_0_4x1(x, vy, n_per_row);
+#else
+    ggml_quantize_mat_q8_0_4x1_generic(x, vy, n_per_row);
+#endif
 }
 #endif
 
@@ -4059,6 +4065,56 @@ namespace ggml::cpu::repack {
 template <typename BLOC_TYPE, int64_t INTER_SIZE, int64_t NB_COLS>
 int repack(struct ggml_tensor *, const void *, size_t);
 
+#if defined(GGML_USE_RISCV_QBS)
+static int repack_qbs_r4(struct ggml_tensor * t, const void * data,
+                         size_t data_size, size_t block_bytes,
+                         int64_t block_elements) {
+    GGML_ASSERT(t->ne[0] > 0 && t->ne[0] % block_elements == 0);
+    const size_t padded_rows = (static_cast<size_t>(ggml_nrows(t)) + 3) & ~size_t(3);
+    const size_t repacked_size =
+        ggml_row_size(t->type, t->ne[0]) * padded_rows;
+    return ggml_riscv_qbs_repack_r4(t->data, repacked_size, data, data_size,
+                                    ggml_nrows(t), t->ne[0] / block_elements,
+                                    block_bytes);
+}
+
+template <> int repack<ggml_riscv_qbs_q4_k_tag, 1, 4>(
+        struct ggml_tensor * t, const void * data, size_t data_size) {
+    GGML_ASSERT(t->type == GGML_TYPE_Q4_K);
+    return repack_qbs_r4(t, data, data_size, sizeof(block_q4_K), QK_K);
+}
+
+template <> int repack<ggml_riscv_qbs_q5_k_tag, 1, 4>(
+        struct ggml_tensor * t, const void * data, size_t data_size) {
+    GGML_ASSERT(t->type == GGML_TYPE_Q5_K);
+    return repack_qbs_r4(t, data, data_size, sizeof(block_q5_K), QK_K);
+}
+
+template <> int repack<ggml_riscv_qbs_q6_k_tag, 1, 4>(
+        struct ggml_tensor * t, const void * data, size_t data_size) {
+    GGML_ASSERT(t->type == GGML_TYPE_Q6_K);
+    return repack_qbs_r4(t, data, data_size, sizeof(block_q6_K), QK_K);
+}
+
+template <> int repack<ggml_riscv_qbs_q3_k_tag, 1, 4>(
+        struct ggml_tensor * t, const void * data, size_t data_size) {
+    GGML_ASSERT(t->type == GGML_TYPE_Q3_K);
+    return repack_qbs_r4(t, data, data_size, sizeof(block_q3_K), QK_K);
+}
+
+template <> int repack<ggml_riscv_qbs_q8_0_tag, 1, 4>(
+        struct ggml_tensor * t, const void * data, size_t data_size) {
+    GGML_ASSERT(t->type == GGML_TYPE_Q8_0);
+    return repack_qbs_r4(t, data, data_size, sizeof(block_q8_0), QK8_0);
+}
+
+template <> int repack<ggml_riscv_qbs_q4_0_tag, 1, 4>(
+        struct ggml_tensor * t, const void * data, size_t data_size) {
+    GGML_ASSERT(t->type == GGML_TYPE_Q4_0);
+    return repack_qbs_r4(t, data, data_size, sizeof(block_q4_0), QK4_0);
+}
+#endif
+
 // TODO: generalise.
 template <> int repack<block_q4_0, 4, 4>(struct ggml_tensor * t, const void * data, size_t data_size) {
     return repack_q4_0_to_q4_0_4_bl(t, 4, data, data_size);
@@ -4160,6 +4216,44 @@ template <> int repack<block_q4_K, 1, 32>(struct ggml_tensor * t, const void * d
 // gemv
 template <typename BLOC_TYPE, int64_t INTER_SIZE, int64_t NB_COLS, ggml_type PARAM_TYPE>
 void gemv(int, float *, size_t, const void *, const void *, int, int);
+
+#if defined(GGML_USE_RISCV_QBS)
+template <> void gemv<ggml_riscv_qbs_q4_k_tag, 1, 4, GGML_TYPE_Q8_K>(
+        int n, float * s, size_t bs, const void * vx, const void * vy,
+        int nr, int nc) {
+    ggml_riscv_qbs_gemv(GGML_TYPE_Q4_K, n, s, bs, vx, vy, nr, nc);
+}
+
+template <> void gemv<ggml_riscv_qbs_q5_k_tag, 1, 4, GGML_TYPE_Q8_K>(
+        int n, float * s, size_t bs, const void * vx, const void * vy,
+        int nr, int nc) {
+    ggml_riscv_qbs_gemv(GGML_TYPE_Q5_K, n, s, bs, vx, vy, nr, nc);
+}
+
+template <> void gemv<ggml_riscv_qbs_q6_k_tag, 1, 4, GGML_TYPE_Q8_K>(
+        int n, float * s, size_t bs, const void * vx, const void * vy,
+        int nr, int nc) {
+    ggml_riscv_qbs_gemv(GGML_TYPE_Q6_K, n, s, bs, vx, vy, nr, nc);
+}
+
+template <> void gemv<ggml_riscv_qbs_q3_k_tag, 1, 4, GGML_TYPE_Q8_K>(
+        int n, float * s, size_t bs, const void * vx, const void * vy,
+        int nr, int nc) {
+    ggml_riscv_qbs_gemv(GGML_TYPE_Q3_K, n, s, bs, vx, vy, nr, nc);
+}
+
+template <> void gemv<ggml_riscv_qbs_q8_0_tag, 1, 4, GGML_TYPE_Q8_0>(
+        int n, float * s, size_t bs, const void * vx, const void * vy,
+        int nr, int nc) {
+    ggml_riscv_qbs_gemv(GGML_TYPE_Q8_0, n, s, bs, vx, vy, nr, nc);
+}
+
+template <> void gemv<ggml_riscv_qbs_q4_0_tag, 1, 4, GGML_TYPE_Q8_0>(
+        int n, float * s, size_t bs, const void * vx, const void * vy,
+        int nr, int nc) {
+    ggml_riscv_qbs_gemv(GGML_TYPE_Q4_0, n, s, bs, vx, vy, nr, nc);
+}
+#endif
 
 template <> void gemv<block_q4_0, 4, 4, GGML_TYPE_Q8_0>(int n, float * s, size_t bs, const void * vx, const void * vy, int nr, int nc) {
     ggml_gemv_q4_0_4x4_q8_0(n, s, bs, vx, vy, nr, nc);
@@ -4263,6 +4357,44 @@ template <> void gemv<block_q4_K, 1, 32, GGML_TYPE_Q8_K>(int n, float * s, size_
 // gemm
 template <typename BLOC_TYPE, int64_t INTER_SIZE, int64_t NB_COLS, ggml_type PARAM_TYPE>
 void gemm(int, float *, size_t, const void *, const void *, int, int);
+
+#if defined(GGML_USE_RISCV_QBS)
+template <> void gemm<ggml_riscv_qbs_q4_k_tag, 1, 4, GGML_TYPE_Q8_K>(
+        int n, float * s, size_t bs, const void * vx, const void * vy,
+        int nr, int nc) {
+    ggml_riscv_qbs_gemm(GGML_TYPE_Q4_K, n, s, bs, vx, vy, nr, nc);
+}
+
+template <> void gemm<ggml_riscv_qbs_q5_k_tag, 1, 4, GGML_TYPE_Q8_K>(
+        int n, float * s, size_t bs, const void * vx, const void * vy,
+        int nr, int nc) {
+    ggml_riscv_qbs_gemm(GGML_TYPE_Q5_K, n, s, bs, vx, vy, nr, nc);
+}
+
+template <> void gemm<ggml_riscv_qbs_q6_k_tag, 1, 4, GGML_TYPE_Q8_K>(
+        int n, float * s, size_t bs, const void * vx, const void * vy,
+        int nr, int nc) {
+    ggml_riscv_qbs_gemm(GGML_TYPE_Q6_K, n, s, bs, vx, vy, nr, nc);
+}
+
+template <> void gemm<ggml_riscv_qbs_q3_k_tag, 1, 4, GGML_TYPE_Q8_K>(
+        int n, float * s, size_t bs, const void * vx, const void * vy,
+        int nr, int nc) {
+    ggml_riscv_qbs_gemm(GGML_TYPE_Q3_K, n, s, bs, vx, vy, nr, nc);
+}
+
+template <> void gemm<ggml_riscv_qbs_q8_0_tag, 1, 4, GGML_TYPE_Q8_0>(
+        int n, float * s, size_t bs, const void * vx, const void * vy,
+        int nr, int nc) {
+    ggml_riscv_qbs_gemm(GGML_TYPE_Q8_0, n, s, bs, vx, vy, nr, nc);
+}
+
+template <> void gemm<ggml_riscv_qbs_q4_0_tag, 1, 4, GGML_TYPE_Q8_0>(
+        int n, float * s, size_t bs, const void * vx, const void * vy,
+        int nr, int nc) {
+    ggml_riscv_qbs_gemm(GGML_TYPE_Q4_0, n, s, bs, vx, vy, nr, nc);
+}
+#endif
 
 template <> void gemm<block_q4_0, 4, 4, GGML_TYPE_Q8_0>(int n, float * s, size_t bs, const void * vx, const void * vy, int nr, int nc) {
     ggml_gemm_q4_0_4x4_q8_0(n, s, bs, vx, vy, nr, nc);
@@ -4739,6 +4871,15 @@ template <typename BLOC_TYPE, int64_t INTER_SIZE, int64_t NB_COLS, ggml_type PAR
 }  // namespace ggml::cpu::repack
 
 static const ggml::cpu::tensor_traits * ggml_repack_get_optimal_repack_type(const struct ggml_tensor * cur) {
+#if defined(GGML_USE_RISCV_QBS)
+    static const ggml::cpu::repack::tensor_traits<ggml_riscv_qbs_q4_k_tag, 1, 4, GGML_TYPE_Q8_K> qbs_q4_K;
+    static const ggml::cpu::repack::tensor_traits<ggml_riscv_qbs_q5_k_tag, 1, 4, GGML_TYPE_Q8_K> qbs_q5_K;
+    static const ggml::cpu::repack::tensor_traits<ggml_riscv_qbs_q6_k_tag, 1, 4, GGML_TYPE_Q8_K> qbs_q6_K;
+    static const ggml::cpu::repack::tensor_traits<ggml_riscv_qbs_q3_k_tag, 1, 4, GGML_TYPE_Q8_K> qbs_q3_K;
+    static const ggml::cpu::repack::tensor_traits<ggml_riscv_qbs_q8_0_tag, 1, 4, GGML_TYPE_Q8_0> qbs_q8_0;
+    static const ggml::cpu::repack::tensor_traits<ggml_riscv_qbs_q4_0_tag, 1, 4, GGML_TYPE_Q8_0> qbs_q4_0;
+#endif
+
     // instance for Q4
     static const ggml::cpu::repack::tensor_traits<block_q4_0, 4, 4, GGML_TYPE_Q8_0> q4_0_4x4_q8_0;
     static const ggml::cpu::repack::tensor_traits<block_q4_0, 8, 4, GGML_TYPE_Q8_0> q4_0_4x8_q8_0;
@@ -4784,6 +4925,26 @@ static const ggml::cpu::tensor_traits * ggml_repack_get_optimal_repack_type(cons
 #endif
 #if defined __riscv_v
     static const ggml::cpu::repack::tensor_traits<block_q4_K, 1, 32, GGML_TYPE_Q8_K> q4_K_32x1_q8_K;
+#endif
+
+#if defined(GGML_USE_RISCV_QBS)
+    if (ggml_n_dims(cur) == 2 &&
+        ggml_riscv_qbs_supports_tensor(cur->type, cur->ne[0], cur->ne[1])) {
+        if (std::getenv("GGML_RISCV_REPACK_TRACE")) {
+            std::fprintf(stderr, "GGML_RISCV_REPACK=QBS type=%s shape=%lldx%lld\n",
+                         ggml_type_name(cur->type), (long long) cur->ne[0],
+                         (long long) cur->ne[1]);
+        }
+        switch (cur->type) {
+            case GGML_TYPE_Q4_K: return &qbs_q4_K;
+            case GGML_TYPE_Q5_K: return &qbs_q5_K;
+            case GGML_TYPE_Q6_K: return &qbs_q6_K;
+            case GGML_TYPE_Q3_K: return &qbs_q3_K;
+            case GGML_TYPE_Q8_0: return &qbs_q8_0;
+            case GGML_TYPE_Q4_0: return &qbs_q4_0;
+            default: break;
+        }
+    }
 #endif
 
     if (cur->type == GGML_TYPE_Q4_0) {
@@ -4955,6 +5116,19 @@ static enum ggml_status ggml_backend_cpu_repack_buffer_init_tensor(ggml_backend_
     return GGML_STATUS_SUCCESS;
 }
 
+static size_t ggml_backend_cpu_repack_buffer_type_get_alloc_size(
+        ggml_backend_buffer_type_t buft, const struct ggml_tensor * tensor) {
+#if defined(GGML_USE_RISCV_QBS)
+    if (ggml_n_dims(tensor) == 2 &&
+        ggml_riscv_qbs_supports_tensor(tensor->type, tensor->ne[0], tensor->ne[1])) {
+        const size_t padded_rows = (static_cast<size_t>(tensor->ne[1]) + 3) & ~size_t(3);
+        return ggml_row_size(tensor->type, tensor->ne[0]) * padded_rows;
+    }
+#endif
+    GGML_UNUSED(buft);
+    return ggml_nbytes(tensor);
+}
+
 static void ggml_backend_cpu_repack_buffer_set_tensor(ggml_backend_buffer_t buffer, struct ggml_tensor * tensor,
                                                        const void * data, size_t offset, size_t size) {
     GGML_ASSERT(offset == 0);
@@ -5050,7 +5224,7 @@ ggml_backend_buffer_type_t ggml_backend_cpu_repack_buffer_type(void) {
                            /* .alloc_buffer     = */ ggml_backend_cpu_repack_buffer_type_alloc_buffer,
                            /* .get_alignment    = */ ggml_backend_cpu_repack_buffer_type_get_alignment,
                            /* .get_max_size     = */ nullptr,  // defaults to SIZE_MAX
-                           /* .get_alloc_size   = */ nullptr,  // defaults to ggml_nbytes
+                           /* .get_alloc_size   = */ ggml_backend_cpu_repack_buffer_type_get_alloc_size,
                            /* .is_host          = */ nullptr,
                            },
         /* .device  = */ ggml_backend_reg_dev_get(ggml_backend_cpu_reg(), 0),
