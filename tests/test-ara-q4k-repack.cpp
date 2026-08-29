@@ -61,7 +61,8 @@ static void test_qbs_r4_layout() {
     constexpr size_t blocks = 65;
     for (const size_t rows : {1, 2, 3, 4, 5, 7, 8, 9}) {
         for (const size_t block_bytes : {
-                 sizeof(block_q4_0), sizeof(block_q3_K), sizeof(block_q4_K),
+                 sizeof(block_q4_0), sizeof(block_q5_0), sizeof(block_iq4_nl),
+                 sizeof(block_q2_K), sizeof(block_q3_K), sizeof(block_q4_K),
                  sizeof(block_q5_K), sizeof(block_q6_K), sizeof(block_q8_0)}) {
             std::vector<uint8_t> source(rows * blocks * block_bytes);
             const size_t padded_rows = (rows + 3) & ~size_t(3);
@@ -332,8 +333,6 @@ static void test_numeric_gemm() {
 
 #if defined(GGML_TEST_RISCV_QBS)
 using qbs_quantize_row_t = void (*)(const float *, void *, int64_t);
-using qbs_dot_t = void (*)(int, float *, size_t, const void *, size_t,
-                           const void *, size_t, int);
 
 struct qbs_test_profile {
     ggml_type type;
@@ -343,8 +342,53 @@ struct qbs_test_profile {
     size_t activation_block_bytes;
     bool activation_q8_0;
     qbs_quantize_row_t quantize_weight;
-    qbs_dot_t dot;
 };
+
+static void qbs_dequantize_weight(ggml_type type, const void * source,
+                                  float * destination, int64_t n) {
+    switch (type) {
+        case GGML_TYPE_Q3_K:
+            dequantize_row_q3_K(static_cast<const block_q3_K *>(source), destination, n);
+            break;
+        case GGML_TYPE_Q4_K:
+            dequantize_row_q4_K(static_cast<const block_q4_K *>(source), destination, n);
+            break;
+        case GGML_TYPE_Q5_K:
+            dequantize_row_q5_K(static_cast<const block_q5_K *>(source), destination, n);
+            break;
+        case GGML_TYPE_Q6_K:
+            dequantize_row_q6_K(static_cast<const block_q6_K *>(source), destination, n);
+            break;
+        case GGML_TYPE_Q8_0:
+            dequantize_row_q8_0(static_cast<const block_q8_0 *>(source), destination, n);
+            break;
+        case GGML_TYPE_Q4_0:
+            dequantize_row_q4_0(static_cast<const block_q4_0 *>(source), destination, n);
+            break;
+        case GGML_TYPE_Q2_K:
+            dequantize_row_q2_K(static_cast<const block_q2_K *>(source), destination, n);
+            break;
+        case GGML_TYPE_Q5_0:
+            dequantize_row_q5_0(static_cast<const block_q5_0 *>(source), destination, n);
+            break;
+        case GGML_TYPE_IQ4_NL:
+            dequantize_row_iq4_nl(static_cast<const block_iq4_nl *>(source), destination, n);
+            break;
+        default:
+            assert(false);
+    }
+}
+
+// Volatile loads keep this test oracle independent of RVV dot-product code.
+static float qbs_scalar_dot(const float * lhs, const float * rhs, int64_t n) {
+    const volatile float * scalar_lhs = lhs;
+    const volatile float * scalar_rhs = rhs;
+    float result = 0.0f;
+    for (int64_t index = 0; index < n; ++index) {
+        result += scalar_lhs[index] * scalar_rhs[index];
+    }
+    return result;
+}
 
 static void quantize_test_q3_k(const float * source, void * destination,
                                int64_t n) {
@@ -376,25 +420,49 @@ static void quantize_test_q4_0(const float * source, void * destination,
     quantize_row_q4_0_ref(source, static_cast<block_q4_0 *>(destination), n);
 }
 
+static void quantize_test_q2_k(const float * source, void * destination,
+                               int64_t n) {
+    quantize_row_q2_K_ref(source, static_cast<block_q2_K *>(destination), n);
+}
+
+static void quantize_test_q5_0(const float * source, void * destination,
+                               int64_t n) {
+    quantize_row_q5_0_ref(source, static_cast<block_q5_0 *>(destination), n);
+}
+
+static void quantize_test_iq4_nl(const float * source, void * destination,
+                                 int64_t n) {
+    quantize_row_iq4_nl_ref(source, static_cast<block_iq4_nl *>(destination), n);
+}
+
 static void test_qbs_emulated_profiles() {
     constexpr int64_t nrows = 35;
-    constexpr int64_t ninputs = 8;
+    constexpr int64_t ninputs = 7;
     static const qbs_test_profile profiles[] = {
         {GGML_TYPE_Q3_K, "Q3_K", QK_K, sizeof(block_q3_K), sizeof(block_q8_K),
-         false, quantize_test_q3_k, ggml_vec_dot_q3_K_q8_K_generic},
+         false, quantize_test_q3_k},
         {GGML_TYPE_Q4_K, "Q4_K", QK_K, sizeof(block_q4_K), sizeof(block_q8_K),
-         false, quantize_test_q4_k, ggml_vec_dot_q4_K_q8_K_generic},
+         false, quantize_test_q4_k},
         {GGML_TYPE_Q5_K, "Q5_K", QK_K, sizeof(block_q5_K), sizeof(block_q8_K),
-         false, quantize_test_q5_k, ggml_vec_dot_q5_K_q8_K_generic},
+         false, quantize_test_q5_k},
         {GGML_TYPE_Q6_K, "Q6_K", QK_K, sizeof(block_q6_K), sizeof(block_q8_K),
-         false, quantize_test_q6_k, ggml_vec_dot_q6_K_q8_K_generic},
+         false, quantize_test_q6_k},
         {GGML_TYPE_Q8_0, "Q8_0", QK8_0, sizeof(block_q8_0), sizeof(block_q8_0),
-         true, quantize_test_q8_0, ggml_vec_dot_q8_0_q8_0_generic},
+         true, quantize_test_q8_0},
         {GGML_TYPE_Q4_0, "Q4_0", QK4_0, sizeof(block_q4_0), sizeof(block_q8_0),
-         true, quantize_test_q4_0, ggml_vec_dot_q4_0_q8_0_generic},
+         true, quantize_test_q4_0},
+        {GGML_TYPE_Q2_K, "Q2_K", QK_K, sizeof(block_q2_K), sizeof(block_q8_K),
+         false, quantize_test_q2_k},
+        {GGML_TYPE_Q5_0, "Q5_0", QK5_0, sizeof(block_q5_0), sizeof(block_q8_0),
+         true, quantize_test_q5_0},
+        {GGML_TYPE_IQ4_NL, "IQ4_NL", QK4_NL, sizeof(block_iq4_nl), sizeof(block_q8_0),
+         true, quantize_test_iq4_nl},
     };
 
-    setenv("GGML_RISCV_QBS_EMULATE", "1", 1);
+    const bool native = std::getenv("GGML_RISCV_QBS") != nullptr;
+    if (!native && std::getenv("GGML_RISCV_QBS_EMULATE") == nullptr) {
+        setenv("GGML_RISCV_QBS_EMULATE", "1", 1);
+    }
     for (const qbs_test_profile & profile : profiles) {
         const int64_t n = 2 * profile.block_elements;
         const size_t blocks_per_row = 2;
@@ -445,6 +513,8 @@ static void test_qbs_emulated_profiles() {
         std::vector<uint8_t> activation(
             ninputs * blocks_per_row * profile.activation_block_bytes);
         std::vector<float> expected(ninputs * nrows);
+        std::vector<float> dequantized_weight(n);
+        std::vector<float> dequantized_activation(n);
         for (size_t input = 0; input < (size_t) ninputs; ++input) {
             uint8_t * activation_row = activation.data() +
                 input * blocks_per_row * profile.activation_block_bytes;
@@ -457,23 +527,65 @@ static void test_qbs_emulated_profiles() {
                     activation_f32.data() + input * n,
                     reinterpret_cast<block_q8_K *>(activation_row), n);
             }
-            for (size_t row = 0; row < (size_t) nrows; ++row) {
-                profile.dot(
-                    n, &expected[input * nrows + row], sizeof(float),
-                    source.data() + row * blocks_per_row * profile.weight_block_bytes,
-                    0, activation_row, 0, 1);
+            if (profile.activation_q8_0) {
+                dequantize_row_q8_0(
+                    reinterpret_cast<const block_q8_0 *>(activation_row),
+                    dequantized_activation.data(), n);
+            } else {
+                dequantize_row_q8_K(
+                    reinterpret_cast<const block_q8_K *>(activation_row),
+                    dequantized_activation.data(), n);
             }
+            for (size_t row = 0; row < (size_t) nrows; ++row) {
+                qbs_dequantize_weight(
+                    profile.type,
+                    source.data() + row * blocks_per_row * profile.weight_block_bytes,
+                    dequantized_weight.data(), n);
+                expected[input * nrows + row] = qbs_scalar_dot(
+                    dequantized_weight.data(), dequantized_activation.data(), n);
+            }
+        }
+        const size_t full_groups = static_cast<size_t>(ninputs) / 4;
+        for (size_t input = full_groups * 4;
+             input < static_cast<size_t>(ninputs); ++input) {
+            std::memcpy(
+                activation_packed.data() +
+                    input * blocks_per_row * profile.activation_block_bytes,
+                activation.data() +
+                    input * blocks_per_row * profile.activation_block_bytes,
+                blocks_per_row * profile.activation_block_bytes);
         }
 
         std::vector<float> actual(ninputs * nrows);
         ggml_riscv_qbs_gemm(profile.type, n, actual.data(), nrows,
                             packed.data(), activation_packed.data(), ninputs,
                             nrows);
+        if (std::getenv("GGML_TEST_QBS_DIAGNOSTIC") != nullptr) {
+            std::fprintf(stderr,
+                         "QBS %s diagnostic GEMM[0,0]: actual=%.9g expected=%.9g\n",
+                         profile.name, actual[0], expected[0]);
+        }
         float max_gemm_error = 0.0f;
         for (size_t index = 0; index < actual.size(); ++index) {
             const float error = std::fabs(actual[index] - expected[index]);
             max_gemm_error = std::max(max_gemm_error, error);
             assert(std::isfinite(actual[index]));
+            if (error > 1e-4f + 1e-5f * std::fabs(expected[index])) {
+                std::fprintf(stderr,
+                             "QBS %s GEMM mismatch input=%zu output=%zu "
+                             "actual=%.9g expected=%.9g error=%.9g\n",
+                             profile.name, index / nrows, index % nrows,
+                             actual[index], expected[index], error);
+            }
+            assert(error <= 1e-4f + 1e-5f * std::fabs(expected[index]));
+        }
+
+        std::vector<float> actual_m2(2 * nrows);
+        ggml_riscv_qbs_gemm(profile.type, n, actual_m2.data(), nrows,
+                            packed.data(), activation.data(), 2, nrows);
+        for (size_t index = 0; index < actual_m2.size(); ++index) {
+            const float error = std::fabs(actual_m2[index] - expected[index]);
+            assert(std::isfinite(actual_m2[index]));
             assert(error <= 1e-4f + 1e-5f * std::fabs(expected[index]));
         }
 
@@ -485,12 +597,20 @@ static void test_qbs_emulated_profiles() {
             const float error = std::fabs(actual[row] - expected[row]);
             max_gemv_error = std::max(max_gemv_error, error);
             assert(std::isfinite(actual[row]));
+            if (error > 1e-4f + 1e-5f * std::fabs(expected[row])) {
+                std::fprintf(stderr,
+                             "QBS %s GEMV mismatch output=%zu actual=%.9g "
+                             "expected=%.9g error=%.9g\n",
+                             profile.name, row, actual[row], expected[row],
+                             error);
+            }
             assert(error <= 1e-4f + 1e-5f * std::fabs(expected[row]));
         }
         std::printf(
-            "QBS %s emulated M1/M8,N35: PASS "
+            "QBS %s %s M1/M2/M3/M4,N35: PASS "
             "(GEMV %.8g, GEMM %.8g max abs error)\n",
-            profile.name, max_gemv_error, max_gemm_error);
+            profile.name, native ? "native" : "emulated",
+            max_gemv_error, max_gemm_error);
     }
 }
 
@@ -534,6 +654,302 @@ static void test_qbs_repack_buffer_tail() {
     ggml_backend_buffer_free(buffer);
     ggml_free(context);
     std::printf("QBS CPU_REPACK N35 padded allocation: PASS\n");
+}
+
+static void test_qbs_moe_repack() {
+    constexpr int64_t n = 2 * QK_K;
+    constexpr int64_t rows_per_expert = 8;
+    constexpr int64_t experts = 3;
+    constexpr size_t blocks_per_row = n / QK_K;
+    constexpr size_t total_rows = rows_per_expert * experts;
+    const size_t source_size =
+        total_rows * blocks_per_row * sizeof(block_q2_K);
+
+    std::vector<uint8_t> source(source_size);
+    for (size_t index = 0; index < source.size(); ++index) {
+        source[index] = static_cast<uint8_t>((index * 37 + 19) & 0xff);
+    }
+    std::vector<uint8_t> expected(source_size);
+    assert(ggml_riscv_qbs_repack_r4(
+               expected.data(), expected.size(), source.data(), source.size(),
+               total_rows, blocks_per_row, sizeof(block_q2_K)) == 0);
+
+    ggml_init_params params{};
+    params.mem_size = 64 * 1024;
+    params.no_alloc = true;
+    ggml_context * context = ggml_init(params);
+    assert(context != nullptr);
+    ggml_tensor * tensor = ggml_new_tensor_3d(
+        context, GGML_TYPE_Q2_K, n, rows_per_expert, experts);
+    ggml_backend_buffer_type_t buffer_type =
+        ggml_backend_cpu_repack_buffer_type();
+    assert(ggml_backend_buft_get_alloc_size(buffer_type, tensor) == source_size);
+    ggml_backend_buffer_t buffer =
+        ggml_backend_alloc_ctx_tensors_from_buft(context, buffer_type);
+    assert(buffer != nullptr && tensor->data != nullptr);
+    ggml_backend_tensor_set(tensor, source.data(), 0, source.size());
+    assert(std::memcmp(tensor->data, expected.data(), expected.size()) == 0);
+    ggml_backend_buffer_free(buffer);
+    ggml_free(context);
+    std::printf("QBS MUL_MAT_ID expert-local R4 repack: PASS\n");
+}
+
+static void test_qbs_moe_repack_fallback() {
+    constexpr int64_t n = 2 * QK_K;
+    constexpr int64_t rows_per_expert = 6;
+    constexpr int64_t experts = 3;
+
+    ggml_init_params params{};
+    params.mem_size = 64 * 1024;
+    params.no_alloc = true;
+    ggml_context * context = ggml_init(params);
+    assert(context != nullptr);
+    ggml_tensor * tensor = ggml_new_tensor_3d(
+        context, GGML_TYPE_Q2_K, n, rows_per_expert, experts);
+    ggml_backend_buffer_type_t buffer_type =
+        ggml_backend_cpu_repack_buffer_type();
+
+    // R4 groups must remain within one expert. Six rows per expert cannot be
+    // globally padded without changing nb02, so this shape must stay in the
+    // ordinary, unpacked GGML layout.
+    assert(ggml_backend_buft_get_alloc_size(buffer_type, tensor) ==
+           ggml_nbytes(tensor));
+
+    ggml_free(context);
+    std::printf("QBS MUL_MAT_ID non-R4 expert shape fallback: PASS\n");
+}
+
+static void test_qbs_moe_graph() {
+    constexpr int64_t n = 2 * QK_K;
+    constexpr int64_t rows_per_expert = 8;
+    constexpr int64_t experts = 3;
+    constexpr int64_t experts_per_token = 2;
+    constexpr int64_t tokens = 3;
+    constexpr size_t blocks_per_row = n / QK_K;
+
+    std::vector<float> weights_f32(experts * rows_per_expert * n);
+    std::vector<block_q2_K> weights_q2(
+        experts * rows_per_expert * blocks_per_row);
+    for (int64_t expert = 0; expert < experts; ++expert) {
+        for (int64_t row = 0; row < rows_per_expert; ++row) {
+            float * source = weights_f32.data() +
+                (expert * rows_per_expert + row) * n;
+            for (int64_t col = 0; col < n; ++col) {
+                source[col] =
+                    0.5f * std::sin(float(expert * 41 + row * 17 + col * 5) *
+                                    0.015625f) -
+                    0.25f * std::cos(float(expert * 13 + row * 29 + col * 3) *
+                                     0.01171875f);
+            }
+            quantize_row_q2_K_ref(
+                source,
+                weights_q2.data() +
+                    (expert * rows_per_expert + row) * blocks_per_row,
+                n);
+        }
+    }
+
+    std::vector<float> activations(tokens * experts_per_token * n);
+    for (int64_t token = 0; token < tokens; ++token) {
+        for (int64_t slot = 0; slot < experts_per_token; ++slot) {
+            float * row = activations.data() +
+                (token * experts_per_token + slot) * n;
+            for (int64_t col = 0; col < n; ++col) {
+                row[col] =
+                    0.375f * std::cos(float(token * 37 + slot * 19 + col * 7) *
+                                      0.013671875f);
+            }
+        }
+    }
+    const std::vector<int32_t> ids = {
+        2, 0,
+        1, 2,
+        0, 1,
+    };
+
+    ggml_init_params weights_params{};
+    weights_params.mem_size = 64 * 1024;
+    weights_params.no_alloc = true;
+    ggml_context * weights_context = ggml_init(weights_params);
+    assert(weights_context != nullptr);
+    ggml_tensor * weights = ggml_new_tensor_3d(
+        weights_context, GGML_TYPE_Q2_K, n, rows_per_expert, experts);
+    ggml_set_name(weights, "qbs_moe_weights");
+    ggml_backend_buffer_t weights_buffer =
+        ggml_backend_alloc_ctx_tensors_from_buft(
+            weights_context, ggml_backend_cpu_repack_buffer_type());
+    assert(weights_buffer != nullptr);
+    ggml_backend_tensor_set(weights, weights_q2.data(), 0,
+                            weights_q2.size() * sizeof(block_q2_K));
+
+    ggml_init_params graph_params{};
+    graph_params.mem_size = 1024 * 1024;
+    graph_params.no_alloc = true;
+    ggml_context * graph_context = ggml_init(graph_params);
+    assert(graph_context != nullptr);
+    ggml_tensor * activation = ggml_new_tensor_3d(
+        graph_context, GGML_TYPE_F32, n, experts_per_token, tokens);
+    ggml_tensor * expert_ids = ggml_new_tensor_2d(
+        graph_context, GGML_TYPE_I32, experts_per_token, tokens);
+    ggml_tensor * output =
+        ggml_mul_mat_id(graph_context, weights, activation, expert_ids);
+    ggml_set_name(output, "qbs_moe_output");
+
+    ggml_backend_t backend =
+        ggml_backend_init_by_type(GGML_BACKEND_DEVICE_TYPE_CPU, nullptr);
+    assert(backend != nullptr);
+    ggml_backend_buffer_t graph_buffer =
+        ggml_backend_alloc_ctx_tensors(graph_context, backend);
+    assert(graph_buffer != nullptr);
+    ggml_backend_tensor_set(activation, activations.data(), 0,
+                            activations.size() * sizeof(float));
+    ggml_backend_tensor_set(expert_ids, ids.data(), 0,
+                            ids.size() * sizeof(int32_t));
+
+    ggml_cgraph * graph = ggml_new_graph(graph_context);
+    ggml_build_forward_expand(graph, output);
+    assert(ggml_backend_graph_compute(backend, graph) == GGML_STATUS_SUCCESS);
+
+    std::vector<float> actual(ggml_nelements(output));
+    ggml_backend_tensor_get(output, actual.data(), 0,
+                            actual.size() * sizeof(float));
+    std::vector<float> weight_dequantized(n);
+    std::vector<float> activation_dequantized(n);
+    std::vector<block_q8_K> activation_q8(blocks_per_row);
+    float max_error = 0.0f;
+    for (int64_t token = 0; token < tokens; ++token) {
+        for (int64_t slot = 0; slot < experts_per_token; ++slot) {
+            quantize_row_q8_K_ref(
+                activations.data() + (token * experts_per_token + slot) * n,
+                activation_q8.data(), n);
+            dequantize_row_q8_K(activation_q8.data(),
+                                activation_dequantized.data(), n);
+            const int64_t expert = ids[token * experts_per_token + slot];
+            for (int64_t row = 0; row < rows_per_expert; ++row) {
+                dequantize_row_q2_K(
+                    weights_q2.data() +
+                        (expert * rows_per_expert + row) * blocks_per_row,
+                    weight_dequantized.data(), n);
+                const float expected = qbs_scalar_dot(
+                    weight_dequantized.data(), activation_dequantized.data(), n);
+                const size_t output_index =
+                    (token * experts_per_token + slot) * rows_per_expert + row;
+                const float error = std::fabs(actual[output_index] - expected);
+                max_error = std::max(max_error, error);
+                assert(std::isfinite(actual[output_index]));
+                assert(error <= 2e-4f + 2e-5f * std::fabs(expected));
+            }
+        }
+    }
+
+    ggml_backend_buffer_free(graph_buffer);
+    ggml_backend_free(backend);
+    ggml_free(graph_context);
+    ggml_backend_buffer_free(weights_buffer);
+    ggml_free(weights_context);
+    std::printf("QBS MUL_MAT_ID Q2_K 3-expert graph: PASS "
+                "(max abs error %.8g)\n", max_error);
+}
+
+static void test_qbs_segmented_k() {
+    constexpr int64_t k_blocks = 280;
+    constexpr int64_t n = k_blocks * QK4_0;
+    constexpr int64_t nrows = 5;
+    constexpr int64_t ninputs = 7;
+
+    assert(ggml_riscv_qbs_supports_tensor(GGML_TYPE_Q4_0, n, nrows));
+
+    std::vector<float> weights_f32(nrows * n);
+    std::vector<float> activations_f32(ninputs * n);
+    for (size_t index = 0; index < weights_f32.size(); ++index) {
+        weights_f32[index] =
+            0.25f * std::sin(float(index % 4093) * 0.00390625f);
+    }
+    for (size_t index = 0; index < activations_f32.size(); ++index) {
+        activations_f32[index] =
+            0.375f * std::cos(float(index % 4051) * 0.003125f);
+    }
+
+    std::vector<block_q4_0> weights(nrows * k_blocks);
+    std::vector<block_q8_0> activations(ninputs * k_blocks);
+    for (int64_t row = 0; row < nrows; ++row) {
+        quantize_row_q4_0_ref(weights_f32.data() + row * n,
+                              weights.data() + row * k_blocks, n);
+    }
+    for (int64_t input = 0; input < ninputs; ++input) {
+        quantize_row_q8_0_ref(activations_f32.data() + input * n,
+                              activations.data() + input * k_blocks, n);
+    }
+
+    std::vector<block_q8_0> activations_packed(ninputs * k_blocks);
+    quantize_q8_0_m4(activations_f32.data(), activations_packed.data(), n);
+    for (int64_t input = 4; input < ninputs; ++input) {
+        std::memcpy(activations_packed.data() + input * k_blocks,
+                    activations.data() + input * k_blocks,
+                    k_blocks * sizeof(block_q8_0));
+    }
+
+    const size_t padded_rows = (nrows + 3) & ~size_t(3);
+    std::vector<block_q4_0> packed(padded_rows * k_blocks);
+    assert(ggml_riscv_qbs_repack_r4(
+               packed.data(), packed.size() * sizeof(block_q4_0),
+               weights.data(), weights.size() * sizeof(block_q4_0),
+               nrows, k_blocks, sizeof(block_q4_0)) == 0);
+
+    std::vector<float> expected(ninputs * nrows, 0.0f);
+    std::vector<float> weight_block(QK4_0);
+    std::vector<float> activation_block(QK8_0);
+    for (int64_t input = 0; input < ninputs; ++input) {
+        for (int64_t row = 0; row < nrows; ++row) {
+            float sum = 0.0f;
+            for (int64_t block = 0; block < k_blocks; ++block) {
+                dequantize_row_q4_0(
+                    weights.data() + row * k_blocks + block,
+                    weight_block.data(), QK4_0);
+                dequantize_row_q8_0(
+                    activations.data() + input * k_blocks + block,
+                    activation_block.data(), QK8_0);
+                sum += qbs_scalar_dot(weight_block.data(),
+                                      activation_block.data(), QK4_0);
+            }
+            expected[input * nrows + row] = sum;
+        }
+    }
+
+    std::vector<float> actual(ninputs * nrows);
+    ggml_riscv_qbs_gemm(GGML_TYPE_Q4_0, n, actual.data(), nrows,
+                        packed.data(), activations_packed.data(), ninputs,
+                        nrows);
+    float max_error = 0.0f;
+    for (size_t index = 0; index < actual.size(); ++index) {
+        const float error = std::fabs(actual[index] - expected[index]);
+        max_error = std::max(max_error, error);
+        assert(std::isfinite(actual[index]));
+        assert(error <= 5e-3f + 2e-4f * std::fabs(expected[index]));
+    }
+
+    std::vector<float> actual_m2(2 * nrows);
+    ggml_riscv_qbs_gemm(GGML_TYPE_Q4_0, n, actual_m2.data(), nrows,
+                        packed.data(), activations.data(), 2, nrows);
+    for (size_t index = 0; index < actual_m2.size(); ++index) {
+        const float error = std::fabs(actual_m2[index] - expected[index]);
+        max_error = std::max(max_error, error);
+        assert(std::isfinite(actual_m2[index]));
+        assert(error <= 5e-3f + 2e-4f * std::fabs(expected[index]));
+    }
+
+    std::fill(actual.begin(), actual.end(), 0.0f);
+    ggml_riscv_qbs_gemv(GGML_TYPE_Q4_0, n, actual.data(), nrows,
+                        packed.data(), activations.data(), 1, nrows);
+    for (int64_t row = 0; row < nrows; ++row) {
+        const float error = std::fabs(actual[row] - expected[row]);
+        max_error = std::max(max_error, error);
+        assert(std::isfinite(actual[row]));
+        assert(error <= 5e-3f + 2e-4f * std::fabs(expected[row]));
+    }
+    std::printf("QBS Q4_0 segmented K=%lld M1/M2/M3/M4: PASS "
+                "(max abs error %.8g)\n",
+                (long long) n, max_error);
 }
 #endif
 
@@ -585,6 +1001,10 @@ int main() {
 #if defined(GGML_TEST_RISCV_QBS)
     test_qbs_emulated_profiles();
     test_qbs_repack_buffer_tail();
+    test_qbs_moe_repack();
+    test_qbs_moe_repack_fallback();
+    test_qbs_moe_graph();
+    test_qbs_segmented_k();
 #endif
     return 0;
 }

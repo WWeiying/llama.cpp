@@ -1,9 +1,36 @@
 #include "llama.h"
 #include <clocale>
+#include <cstdint>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <string>
 #include <vector>
+
+struct logits_dump_record {
+    uint32_t magic;
+    uint32_t version;
+    uint32_t step;
+    uint32_t n_vocab;
+    int32_t  target_token;
+    uint32_t reserved;
+};
+
+static constexpr uint32_t LOGITS_DUMP_MAGIC = 0x5142534c;
+
+static bool dump_logits(
+        FILE * file, const float * logits, uint32_t step, uint32_t n_vocab, llama_token target_token) {
+    if (file == nullptr) {
+        return true;
+    }
+    const logits_dump_record record = {
+        LOGITS_DUMP_MAGIC, 2, step, n_vocab, target_token, 0,
+    };
+    return logits != nullptr &&
+           fwrite(&record, sizeof(record), 1, file) == 1 &&
+           fwrite(logits, sizeof(*logits), n_vocab, file) == n_vocab &&
+           fflush(file) == 0;
+}
 
 static void print_usage(int, char ** argv) {
     printf("\nexample usage:\n");
@@ -94,6 +121,18 @@ int main(int argc, char ** argv) {
     }
 
     const llama_vocab * vocab = llama_model_get_vocab(model);
+    const uint32_t n_vocab = llama_vocab_n_tokens(vocab);
+    const bool teacher_force = std::getenv("LLAMA_SIMPLE_TEACHER_FORCE") != nullptr;
+    FILE * logits_file = nullptr;
+    if (const char * logits_path = std::getenv("LLAMA_SIMPLE_LOGITS_FILE")) {
+        logits_file = std::fopen(logits_path, "wb");
+        if (logits_file == nullptr) {
+            std::fprintf(stderr, "%s: unable to open logits dump %s\n",
+                         __func__, logits_path);
+            llama_model_free(model);
+            return 1;
+        }
+    }
     // tokenize the prompt
 
     // find the number of tokens in the prompt
@@ -110,7 +149,7 @@ int main(int argc, char ** argv) {
 
     llama_context_params ctx_params = llama_context_default_params();
     // n_ctx is the context size
-    ctx_params.n_ctx = n_prompt + n_predict - 1;
+    ctx_params.n_ctx = teacher_force ? n_prompt : n_prompt + n_predict - 1;
     // n_batch is the maximum number of tokens that can be processed in a single call to llama_decode
     ctx_params.n_batch = n_prompt;
     // enable performance counters
@@ -121,6 +160,54 @@ int main(int argc, char ** argv) {
     if (ctx == NULL) {
         fprintf(stderr , "%s: error: failed to create the llama_context\n" , __func__);
         return 1;
+    }
+
+    if (teacher_force) {
+        if (n_prompt < 2) {
+            fprintf(stderr, "%s: teacher-forced evaluation needs at least two tokens\n", __func__);
+            return 1;
+        }
+
+        llama_batch batch = llama_batch_init(n_prompt, 0, 1);
+        batch.n_tokens = n_prompt;
+        for (int pos = 0; pos < n_prompt; ++pos) {
+            batch.token[pos] = prompt_tokens[pos];
+            batch.pos[pos] = pos;
+            batch.n_seq_id[pos] = 1;
+            batch.seq_id[pos][0] = 0;
+            batch.logits[pos] = pos + 1 < n_prompt;
+        }
+
+        const auto t_eval_start = ggml_time_us();
+        if (llama_decode(ctx, batch)) {
+            fprintf(stderr, "%s: teacher-forced decode failed\n", __func__);
+            llama_batch_free(batch);
+            return 1;
+        }
+
+        for (int pos = 0; pos + 1 < n_prompt; ++pos) {
+            if (!dump_logits(logits_file, llama_get_logits_ith(ctx, pos), pos,
+                             n_vocab, prompt_tokens[pos + 1])) {
+                fprintf(stderr, "%s: failed to write teacher-forced logits\n", __func__);
+                llama_batch_free(batch);
+                return 1;
+            }
+        }
+        const auto t_eval_end = ggml_time_us();
+
+        printf("LLAMA_TEACHER_RECORDS=%d\n", n_prompt - 1);
+        fprintf(stderr, "%s: evaluated %d fixed next-token targets in %.2f s\n",
+                __func__, n_prompt - 1,
+                (t_eval_end - t_eval_start) / 1000000.0f);
+        llama_perf_context_print(ctx);
+
+        llama_batch_free(batch);
+        llama_free(ctx);
+        llama_model_free(model);
+        if (logits_file != nullptr) {
+            std::fclose(logits_file);
+        }
+        return 0;
     }
 
     // initialize the sampler
@@ -175,6 +262,12 @@ int main(int argc, char ** argv) {
             return 1;
         }
 
+        if (!dump_logits(logits_file, llama_get_logits_ith(ctx, -1), n_decode,
+                         n_vocab, LLAMA_TOKEN_NULL)) {
+            fprintf(stderr, "%s: failed to write logits dump\n", __func__);
+            return 1;
+        }
+
         n_pos += batch.n_tokens;
 
         // sample the next token
@@ -218,6 +311,9 @@ int main(int argc, char ** argv) {
     llama_sampler_free(smpl);
     llama_free(ctx);
     llama_model_free(model);
+    if (logits_file != nullptr) {
+        std::fclose(logits_file);
+    }
 
     return 0;
 }
