@@ -4074,9 +4074,10 @@ static int repack_qbs_r4(struct ggml_tensor * t, const void * data,
     const size_t padded_rows = (static_cast<size_t>(ggml_nrows(t)) + 3) & ~size_t(3);
     const size_t repacked_size =
         ggml_row_size(t->type, t->ne[0]) * padded_rows;
-    return ggml_riscv_qbs_repack_r4(t->data, repacked_size, data, data_size,
-                                    ggml_nrows(t), t->ne[0] / block_elements,
-                                    block_bytes);
+    GGML_UNUSED(block_bytes);
+    return ggml_riscv_qbs_repack_r4(t->type, t->data, repacked_size, data,
+                                    data_size, ggml_nrows(t),
+                                    t->ne[0] / block_elements);
 }
 
 template <> int repack<ggml_riscv_qbs_q4_k_tag, 1, 4>(

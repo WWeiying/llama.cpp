@@ -448,15 +448,21 @@ function(ggml_add_cpu_backend_variant_impl tag_name)
             if (NOT GGML_CPU_REPACK)
                 message(FATAL_ERROR "GGML_RISCV_QBS requires GGML_CPU_REPACK")
             endif()
-            if (NOT EXISTS "${GGML_RISCV_QBS_INCLUDE_DIR}/qbs_abi.h")
-                message(FATAL_ERROR "GGML_RISCV_QBS_INCLUDE_DIR must contain qbs_abi.h")
+            if (NOT GGML_RISCV_QBS_RUNTIME_DIR AND GGML_RISCV_QBS_INCLUDE_DIR)
+                get_filename_component(GGML_RISCV_QBS_RUNTIME_DIR
+                    "${GGML_RISCV_QBS_INCLUDE_DIR}/../../software/qbs" ABSOLUTE)
+            endif()
+            if (NOT EXISTS "${GGML_RISCV_QBS_RUNTIME_DIR}/include/qbs/qbs.h")
+                message(FATAL_ERROR "GGML_RISCV_QBS_RUNTIME_DIR must contain include/qbs/qbs.h")
             endif()
             target_compile_definitions(${GGML_CPU_NAME} PRIVATE GGML_USE_RISCV_QBS)
-            target_include_directories(${GGML_CPU_NAME} PRIVATE ${GGML_RISCV_QBS_INCLUDE_DIR})
+            target_include_directories(${GGML_CPU_NAME} PRIVATE
+                ${GGML_RISCV_QBS_RUNTIME_DIR}/include)
             list(APPEND GGML_CPU_SOURCES
                 ggml-cpu/arch/riscv/qbs.cpp
                 ggml-cpu/arch/riscv/qbs.h
-                ggml-cpu/arch/riscv/qbs-layout.h
+                ${GGML_RISCV_QBS_RUNTIME_DIR}/src/qbs_runtime.c
+                ${GGML_RISCV_QBS_RUNTIME_DIR}/src/qbs_native_riscv.c
                 )
         endif()
         if (GGML_CPU_RISCV64_SPACEMIT)

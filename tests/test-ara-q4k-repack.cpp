@@ -493,8 +493,8 @@ static void test_qbs_emulated_profiles() {
         std::vector<uint8_t> packed(
             padded_rows * blocks_per_row * profile.weight_block_bytes);
         assert(ggml_riscv_qbs_repack_r4(
-                   packed.data(), packed.size(), source.data(), source.size(),
-                   nrows, blocks_per_row, profile.weight_block_bytes) == 0);
+                   profile.type, packed.data(), packed.size(), source.data(),
+                   source.size(), nrows, blocks_per_row) == 0);
 
         std::vector<uint8_t> activation_packed(
             ninputs * blocks_per_row * profile.activation_block_bytes);
@@ -633,8 +633,8 @@ static void test_qbs_repack_buffer_tail() {
     }
     std::vector<uint8_t> expected(padded_size);
     assert(ggml_riscv_qbs_repack_r4(
-               expected.data(), expected.size(), source.data(), source_size,
-               nrows, blocks_per_row, sizeof(block_q4_K)) == 0);
+               GGML_TYPE_Q4_K, expected.data(), expected.size(), source.data(),
+               source_size, nrows, blocks_per_row) == 0);
 
     ggml_init_params params{};
     params.mem_size = 64 * 1024;
@@ -671,8 +671,8 @@ static void test_qbs_moe_repack() {
     }
     std::vector<uint8_t> expected(source_size);
     assert(ggml_riscv_qbs_repack_r4(
-               expected.data(), expected.size(), source.data(), source.size(),
-               total_rows, blocks_per_row, sizeof(block_q2_K)) == 0);
+               GGML_TYPE_Q2_K, expected.data(), expected.size(), source.data(),
+               source.size(), total_rows, blocks_per_row) == 0);
 
     ggml_init_params params{};
     params.mem_size = 64 * 1024;
@@ -892,9 +892,9 @@ static void test_qbs_segmented_k() {
     const size_t padded_rows = (nrows + 3) & ~size_t(3);
     std::vector<block_q4_0> packed(padded_rows * k_blocks);
     assert(ggml_riscv_qbs_repack_r4(
-               packed.data(), packed.size() * sizeof(block_q4_0),
-               weights.data(), weights.size() * sizeof(block_q4_0),
-               nrows, k_blocks, sizeof(block_q4_0)) == 0);
+               GGML_TYPE_Q4_0, packed.data(),
+               packed.size() * sizeof(block_q4_0), weights.data(),
+               weights.size() * sizeof(block_q4_0), nrows, k_blocks) == 0);
 
     std::vector<float> expected(ninputs * nrows, 0.0f);
     std::vector<float> weight_block(QK4_0);
