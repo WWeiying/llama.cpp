@@ -180,6 +180,8 @@ option(GGML_RV_ZVFBFWMA      "ggml: enable riscv zvfbfwma"    OFF)
 option(GGML_RISCV_QBS         "ggml: enable experimental RISC-V QBS backend" OFF)
 set(GGML_RISCV_QBS_INCLUDE_DIR "" CACHE PATH "ggml: directory containing qbs_abi.h")
 set(GGML_RISCV_QBS_RUNTIME_DIR "" CACHE PATH "ggml: QBS runtime library source directory")
+option(GGML_RISCV_AKV         "ggml: enable experimental RISC-V AKV attention backend" OFF)
+set(GGML_RISCV_AKV_RUNTIME_DIR "" CACHE PATH "ggml: AKV runtime library source directory")
 option(GGML_XTHEADVECTOR     "ggml: enable xtheadvector"      OFF)
 option(GGML_VXE              "ggml: enable vxe"               ${GGML_NATIVE})
 

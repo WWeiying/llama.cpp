@@ -8,6 +8,10 @@
 #include "unary-ops.h"
 #include "vec.h"
 
+#ifdef GGML_USE_RISCV_AKV
+#include "arch/riscv/akv.h"
+#endif
+
 #include <algorithm>
 #include <cfloat>
 #include <cmath>
@@ -9066,6 +9070,12 @@ static void ggml_flash_attn_ext_reduce_partials(
 static void ggml_compute_forward_flash_attn_ext_f16(
         const ggml_compute_params * params,
         ggml_tensor * dst) {
+
+#ifdef GGML_USE_RISCV_AKV
+    if (ggml_riscv_akv_flash_attn(params, dst)) {
+        return;
+    }
+#endif
 
     const ggml_tensor * q     = dst->src[0];
     const ggml_tensor * k     = dst->src[1];

@@ -465,6 +465,28 @@ function(ggml_add_cpu_backend_variant_impl tag_name)
                 ${GGML_RISCV_QBS_RUNTIME_DIR}/src/qbs_native_riscv.c
                 )
         endif()
+        if (GGML_RISCV_AKV)
+            if (NOT GGML_RVV)
+                message(FATAL_ERROR "GGML_RISCV_AKV requires GGML_RVV")
+            endif()
+            if (NOT GGML_RV_ZFH OR NOT GGML_RV_ZVFH)
+                message(FATAL_ERROR "GGML_RISCV_AKV requires GGML_RV_ZFH and GGML_RV_ZVFH")
+            endif()
+            if (NOT EXISTS "${GGML_RISCV_AKV_RUNTIME_DIR}/include/akv/akv.h")
+                message(FATAL_ERROR "GGML_RISCV_AKV_RUNTIME_DIR must contain include/akv/akv.h")
+            endif()
+            enable_language(ASM)
+            target_compile_definitions(${GGML_CPU_NAME} PRIVATE GGML_USE_RISCV_AKV)
+            target_include_directories(${GGML_CPU_NAME} PRIVATE
+                ${GGML_RISCV_AKV_RUNTIME_DIR}/include)
+            list(APPEND GGML_CPU_SOURCES
+                ggml-cpu/arch/riscv/akv.cpp
+                ggml-cpu/arch/riscv/akv.h
+                ${GGML_RISCV_AKV_RUNTIME_DIR}/src/akv_runtime.c
+                ${GGML_RISCV_AKV_RUNTIME_DIR}/src/akv_native_riscv.c
+                ${GGML_RISCV_AKV_RUNTIME_DIR}/src/akv_attention_rvv.S
+                )
+        endif()
         if (GGML_CPU_RISCV64_SPACEMIT)
             include(ggml-cpu/cmake/FindSMTIME.cmake)
             target_compile_definitions(${GGML_CPU_NAME} PRIVATE GGML_USE_CPU_RISCV64_SPACEMIT ${RISCV64_SPACEMIT_IME_SPEC})
