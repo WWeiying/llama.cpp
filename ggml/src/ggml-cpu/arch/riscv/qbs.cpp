@@ -13,9 +13,12 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <deque>
 #include <limits>
 #include <mutex>
+#include <string>
 #include <unordered_set>
+#include <utility>
 #include <vector>
 
 namespace {
@@ -76,6 +79,75 @@ enum class qbs_support_reason {
 
 constexpr size_t                                         QBS_TRACE_FORMATS = 9;
 static std::array<qbs_trace_counters, QBS_TRACE_FORMATS> qbs_trace{};
+
+struct qbs_activation_trace_record {
+    uint64_t             sequence;
+    const void *         source_tensor_identity;
+    const void *         source_data;
+    ggml_type            activation_type;
+    int64_t              activation_rows;
+    int64_t              k_elements;
+    uint64_t             digest;
+    std::string          weight_name;
+    std::vector<uint8_t> quantized_data;
+};
+
+struct qbs_activation_trace_state {
+    std::mutex                              mutex;
+    std::deque<qbs_activation_trace_record> records;
+    uint64_t                                sequence               = 0;
+    uint64_t                                quantizations           = 0;
+    uint64_t                                exact_reuse_candidates  = 0;
+    uint64_t                                quantized_bytes          = 0;
+    uint64_t                                reusable_quantized_bytes = 0;
+    size_t                                  retained_snapshot_bytes  = 0;
+};
+
+static qbs_activation_trace_state & activation_trace_state() {
+    static auto * state = new qbs_activation_trace_state;
+    return *state;
+}
+
+static uint64_t activation_digest(const void * data, size_t bytes) {
+    const auto * values = static_cast<const uint8_t *>(data);
+    uint64_t     hash   = UINT64_C(1469598103934665603);
+    for (size_t index = 0; index < bytes; ++index) {
+        hash ^= values[index];
+        hash *= UINT64_C(1099511628211);
+    }
+    return hash;
+}
+
+static std::string trace_name(const char * name) {
+    std::string result = name && name[0] ? name : "<unnamed>";
+    for (char & character : result) {
+        if (std::isspace(static_cast<unsigned char>(character)) || character == '=') {
+            character = '_';
+        }
+    }
+    return result;
+}
+
+static void print_activation_trace_summary() {
+    auto & state = activation_trace_state();
+    std::lock_guard<std::mutex> lock(state.mutex);
+    std::fprintf(stderr,
+                 "GGML_RISCV_QBS_LIFETIME_SUMMARY quantizations=%llu "
+                 "exact_reuse_candidates=%llu quantized_bytes=%llu "
+                 "reusable_quantized_bytes=%llu\n",
+                 static_cast<unsigned long long>(state.quantizations),
+                 static_cast<unsigned long long>(state.exact_reuse_candidates),
+                 static_cast<unsigned long long>(state.quantized_bytes),
+                 static_cast<unsigned long long>(state.reusable_quantized_bytes));
+}
+
+static void ensure_activation_trace_registered() {
+    static const bool registered = [] {
+        std::atexit(print_activation_trace_summary);
+        return true;
+    }();
+    (void) registered;
+}
 
 static qbs_encoding_pair encoding_for_type(ggml_type type) {
     switch (type) {
@@ -781,6 +853,96 @@ void ggml_riscv_qbs_trace_tensor_decision(const void * tensor_identity,
                      selected && k_elements > 0 &&
                          static_cast<uint64_t>(k_elements) / qbs_weight_block_elements(profile_for_type(type).weight) >
                              std::min<unsigned>(device().capabilities.max_k_blocks, QBS_MAX_K_BLOCKS));
+    }
+}
+
+void ggml_riscv_qbs_trace_activation_lifetime(const void * op_identity,
+                                              const char * op_name,
+                                              const void * weight_identity,
+                                              const char * weight_name,
+                                              ggml_type    weight_type,
+                                              const void * source_tensor_identity,
+                                              const char * source_name,
+                                              const void * source_data,
+                                              const void * quantized_data,
+                                              size_t       quantized_bytes,
+                                              ggml_type    activation_type,
+                                              int64_t      activation_rows,
+                                              int64_t      k_elements) {
+    if (!env_true("GGML_RISCV_QBS_TRACE_LIFETIME") || quantized_data == nullptr || quantized_bytes == 0) {
+        return;
+    }
+
+    constexpr size_t MAX_RECORDS        = 64;
+    constexpr size_t MAX_SNAPSHOT_BYTES = 8u * 1024u * 1024u;
+    constexpr size_t MAX_RETAINED_BYTES = 64u * 1024u * 1024u;
+
+    const uint64_t digest = activation_digest(quantized_data, quantized_bytes);
+    auto &         state  = activation_trace_state();
+    ensure_activation_trace_registered();
+    std::lock_guard<std::mutex> lock(state.mutex);
+
+    const uint64_t sequence = ++state.sequence;
+    ++state.quantizations;
+    state.quantized_bytes += quantized_bytes;
+
+    const qbs_activation_trace_record * exact_match = nullptr;
+    for (auto record = state.records.rbegin(); record != state.records.rend(); ++record) {
+        const bool same_source = record->source_tensor_identity == source_tensor_identity ||
+                                 record->source_data == source_data;
+        if (!same_source || record->activation_type != activation_type ||
+            record->activation_rows != activation_rows || record->k_elements != k_elements ||
+            record->quantized_data.size() != quantized_bytes || record->digest != digest) {
+            continue;
+        }
+        if (std::memcmp(record->quantized_data.data(), quantized_data, quantized_bytes) == 0) {
+            exact_match = &*record;
+            break;
+        }
+    }
+
+    const bool reusable = exact_match != nullptr;
+    if (reusable) {
+        ++state.exact_reuse_candidates;
+        state.reusable_quantized_bytes += quantized_bytes;
+    }
+
+    std::fprintf(stderr,
+                 "GGML_RISCV_QBS_LIFETIME seq=%llu op=%s weight=%s "
+                 "weight_type=%s source=%s activation_type=%s rows=%lld k=%lld "
+                 "bytes=%zu digest=%016llx match_seq=%llu match_weight=%s "
+                 "same_tensor=%d same_data=%d reusable=%d op_id=%p weight_id=%p source_id=%p source_data=%p\n",
+                 static_cast<unsigned long long>(sequence), trace_name(op_name).c_str(),
+                 trace_name(weight_name).c_str(), ggml_type_name(weight_type), trace_name(source_name).c_str(),
+                 ggml_type_name(activation_type), static_cast<long long>(activation_rows),
+                 static_cast<long long>(k_elements), quantized_bytes, static_cast<unsigned long long>(digest),
+                 static_cast<unsigned long long>(exact_match ? exact_match->sequence : 0),
+                 exact_match ? exact_match->weight_name.c_str() : "-",
+                 exact_match && exact_match->source_tensor_identity == source_tensor_identity,
+                 exact_match && exact_match->source_data == source_data, reusable, op_identity, weight_identity,
+                 source_tensor_identity, source_data);
+
+    if (quantized_bytes > MAX_SNAPSHOT_BYTES) {
+        return;
+    }
+
+    qbs_activation_trace_record record = {
+        sequence,
+        source_tensor_identity,
+        source_data,
+        activation_type,
+        activation_rows,
+        k_elements,
+        digest,
+        trace_name(weight_name),
+        std::vector<uint8_t>(static_cast<const uint8_t *>(quantized_data),
+                             static_cast<const uint8_t *>(quantized_data) + quantized_bytes),
+    };
+    state.retained_snapshot_bytes += record.quantized_data.size();
+    state.records.emplace_back(std::move(record));
+    while (state.records.size() > MAX_RECORDS || state.retained_snapshot_bytes > MAX_RETAINED_BYTES) {
+        state.retained_snapshot_bytes -= state.records.front().quantized_data.size();
+        state.records.pop_front();
     }
 }
 

@@ -4785,6 +4785,16 @@ template <typename BLOC_TYPE, int64_t INTER_SIZE, int64_t NB_COLS, ggml_type PAR
 
         ggml_barrier(params->threadpool);
 
+#if defined(GGML_USE_RISCV_QBS)
+        if constexpr (is_qbs_block_type<BLOC_TYPE>::value) {
+            if (ith == 0) {
+                ggml_riscv_qbs_trace_activation_lifetime(
+                    op, op->name, src0, src0->name, src0->type, src1, src1->name, src1->data,
+                    wdata, nbw2 * ne12, PARAM_TYPE, ne11 * ne12, ne10);
+            }
+        }
+#endif
+
         // The first chunk comes from our thread_id, the rest will get auto-assigned.
         int current_chunk = ith;
 
