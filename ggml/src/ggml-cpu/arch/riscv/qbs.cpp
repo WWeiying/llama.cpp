@@ -100,6 +100,9 @@ struct qbs_activation_trace_state {
     uint64_t                                exact_reuse_candidates  = 0;
     uint64_t                                quantized_bytes          = 0;
     uint64_t                                reusable_quantized_bytes = 0;
+    uint64_t                                quantizations_with_time = 0;
+    uint64_t                                quantize_time_us        = 0;
+    uint64_t                                reusable_quantize_time_us = 0;
     size_t                                  retained_snapshot_bytes  = 0;
 };
 
@@ -134,11 +137,15 @@ static void print_activation_trace_summary() {
     std::fprintf(stderr,
                  "GGML_RISCV_QBS_LIFETIME_SUMMARY quantizations=%llu "
                  "exact_reuse_candidates=%llu quantized_bytes=%llu "
-                 "reusable_quantized_bytes=%llu\n",
+                 "reusable_quantized_bytes=%llu quantizations_with_time=%llu "
+                 "quantize_time_us=%llu reusable_quantize_time_us=%llu\n",
                  static_cast<unsigned long long>(state.quantizations),
                  static_cast<unsigned long long>(state.exact_reuse_candidates),
                  static_cast<unsigned long long>(state.quantized_bytes),
-                 static_cast<unsigned long long>(state.reusable_quantized_bytes));
+                 static_cast<unsigned long long>(state.reusable_quantized_bytes),
+                 static_cast<unsigned long long>(state.quantizations_with_time),
+                 static_cast<unsigned long long>(state.quantize_time_us),
+                 static_cast<unsigned long long>(state.reusable_quantize_time_us));
 }
 
 static void ensure_activation_trace_registered() {
@@ -856,6 +863,10 @@ void ggml_riscv_qbs_trace_tensor_decision(const void * tensor_identity,
     }
 }
 
+bool ggml_riscv_qbs_trace_activation_lifetime_enabled() {
+    return env_true("GGML_RISCV_QBS_TRACE_LIFETIME");
+}
+
 void ggml_riscv_qbs_trace_activation_lifetime(const void * op_identity,
                                               const char * op_name,
                                               const void * weight_identity,
@@ -868,8 +879,10 @@ void ggml_riscv_qbs_trace_activation_lifetime(const void * op_identity,
                                               size_t       quantized_bytes,
                                               ggml_type    activation_type,
                                               int64_t      activation_rows,
-                                              int64_t      k_elements) {
-    if (!env_true("GGML_RISCV_QBS_TRACE_LIFETIME") || quantized_data == nullptr || quantized_bytes == 0) {
+                                              int64_t      k_elements,
+                                              bool         quantize_time_valid,
+                                              uint64_t     quantize_time_us) {
+    if (!ggml_riscv_qbs_trace_activation_lifetime_enabled() || quantized_data == nullptr || quantized_bytes == 0) {
         return;
     }
 
@@ -885,11 +898,14 @@ void ggml_riscv_qbs_trace_activation_lifetime(const void * op_identity,
     const uint64_t sequence = ++state.sequence;
     ++state.quantizations;
     state.quantized_bytes += quantized_bytes;
+    if (quantize_time_valid) {
+        ++state.quantizations_with_time;
+        state.quantize_time_us += quantize_time_us;
+    }
 
     const qbs_activation_trace_record * exact_match = nullptr;
     for (auto record = state.records.rbegin(); record != state.records.rend(); ++record) {
-        const bool same_source = record->source_tensor_identity == source_tensor_identity ||
-                                 record->source_data == source_data;
+        const bool same_source = record->source_tensor_identity == source_tensor_identity;
         if (!same_source || record->activation_type != activation_type ||
             record->activation_rows != activation_rows || record->k_elements != k_elements ||
             record->quantized_data.size() != quantized_bytes || record->digest != digest) {
@@ -905,13 +921,17 @@ void ggml_riscv_qbs_trace_activation_lifetime(const void * op_identity,
     if (reusable) {
         ++state.exact_reuse_candidates;
         state.reusable_quantized_bytes += quantized_bytes;
+        if (quantize_time_valid) {
+            state.reusable_quantize_time_us += quantize_time_us;
+        }
     }
 
     std::fprintf(stderr,
                  "GGML_RISCV_QBS_LIFETIME seq=%llu op=%s weight=%s "
                  "weight_type=%s source=%s activation_type=%s rows=%lld k=%lld "
                  "bytes=%zu digest=%016llx match_seq=%llu match_weight=%s "
-                 "same_tensor=%d same_data=%d reusable=%d op_id=%p weight_id=%p source_id=%p source_data=%p\n",
+                 "same_tensor=%d same_data=%d reusable=%d quantize_time_valid=%d "
+                 "quantize_time_us=%llu op_id=%p weight_id=%p source_id=%p source_data=%p quantized_data=%p\n",
                  static_cast<unsigned long long>(sequence), trace_name(op_name).c_str(),
                  trace_name(weight_name).c_str(), ggml_type_name(weight_type), trace_name(source_name).c_str(),
                  ggml_type_name(activation_type), static_cast<long long>(activation_rows),
@@ -919,8 +939,9 @@ void ggml_riscv_qbs_trace_activation_lifetime(const void * op_identity,
                  static_cast<unsigned long long>(exact_match ? exact_match->sequence : 0),
                  exact_match ? exact_match->weight_name.c_str() : "-",
                  exact_match && exact_match->source_tensor_identity == source_tensor_identity,
-                 exact_match && exact_match->source_data == source_data, reusable, op_identity, weight_identity,
-                 source_tensor_identity, source_data);
+                 exact_match && exact_match->source_data == source_data, reusable, quantize_time_valid,
+                 static_cast<unsigned long long>(quantize_time_us), op_identity, weight_identity,
+                 source_tensor_identity, source_data, quantized_data);
 
     if (quantized_bytes > MAX_SNAPSHOT_BYTES) {
         return;

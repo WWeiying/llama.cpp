@@ -35,6 +35,8 @@ void ggml_riscv_qbs_trace_tensor_decision(const void * tensor_identity,
                                           int64_t      matrix_count,
                                           bool         selected);
 
+bool ggml_riscv_qbs_trace_activation_lifetime_enabled();
+
 void ggml_riscv_qbs_trace_activation_lifetime(const void * op_identity,
                                               const char * op_name,
                                               const void * weight_identity,
@@ -47,7 +49,9 @@ void ggml_riscv_qbs_trace_activation_lifetime(const void * op_identity,
                                               size_t       quantized_bytes,
                                               ggml_type    activation_type,
                                               int64_t      activation_rows,
-                                              int64_t      k_elements);
+                                              int64_t      k_elements,
+                                              bool         quantize_time_valid,
+                                              uint64_t     quantize_time_us);
 
 int ggml_riscv_qbs_repack_r4(ggml_type    type,
                              void *       dst,

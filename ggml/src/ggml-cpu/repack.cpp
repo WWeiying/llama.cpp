@@ -4724,6 +4724,14 @@ template <typename BLOC_TYPE, int64_t INTER_SIZE, int64_t NB_COLS, ggml_type PAR
 
         const ggml_from_float_t from_float = ggml_get_type_traits_cpu(PARAM_TYPE)->from_float;
 
+#if defined(GGML_USE_RISCV_QBS)
+        const bool trace_qbs_lifetime = is_qbs_block_type<BLOC_TYPE>::value &&
+                                        ggml_riscv_qbs_trace_activation_lifetime_enabled();
+        const bool quantize_time_valid = trace_qbs_lifetime && nth == 1 && ith == 0;
+        const uint64_t quantize_time_start_us = quantize_time_valid ? ggml_time_us() : 0;
+        uint64_t quantize_time_us = 0;
+#endif
+
         // INFO: Quantization is done in planes to avoid extra complexity in chunking.
         // Flattening dimensions not multiple of INTER_SIZE would require extra handling depending on how
         // the planes are broadcast.
@@ -4741,6 +4749,12 @@ template <typename BLOC_TYPE, int64_t INTER_SIZE, int64_t NB_COLS, ggml_type PAR
                 from_float((float *) (data_ptr + i11 * nb11), (void *) (wdata_ptr + i11 * nbw1), ne10);
             }
         }
+
+#if defined(GGML_USE_RISCV_QBS)
+        if (quantize_time_valid) {
+            quantize_time_us = static_cast<uint64_t>(ggml_time_us()) - quantize_time_start_us;
+        }
+#endif
 
         // disable for NUMA
         const bool disable_chunking = ggml_is_numa();
@@ -4790,7 +4804,8 @@ template <typename BLOC_TYPE, int64_t INTER_SIZE, int64_t NB_COLS, ggml_type PAR
             if (ith == 0) {
                 ggml_riscv_qbs_trace_activation_lifetime(
                     op, op->name, src0, src0->name, src0->type, src1, src1->name, src1->data,
-                    wdata, nbw2 * ne12, PARAM_TYPE, ne11 * ne12, ne10);
+                    wdata, nbw2 * ne12, PARAM_TYPE, ne11 * ne12, ne10,
+                    quantize_time_valid, quantize_time_us);
             }
         }
 #endif
