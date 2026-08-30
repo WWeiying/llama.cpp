@@ -25,6 +25,11 @@ struct qbs_profile {
     unsigned activation;
 };
 
+struct qbs_encoding_pair {
+    uint64_t weight;
+    uint64_t activation;
+};
+
 struct qbs_trace_counters {
     std::atomic<uint64_t>                        gemv_calls{ 0 };
     std::atomic<uint64_t>                        gemm_calls{ 0 };
@@ -37,6 +42,9 @@ struct qbs_trace_counters {
     std::atomic<uint64_t>                        emulated_commands{ 0 };
     std::atomic<uint64_t>                        command_dot_elements{ 0 };
     std::atomic<uint64_t>                        segmented_commands{ 0 };
+    std::atomic<uint64_t>                        context_fill_commands{ 0 };
+    std::atomic<uint64_t>                        context_reuse_commands{ 0 };
+    std::atomic<uint64_t>                        context_release_commands{ 0 };
 
     std::atomic<uint64_t> candidate_tensors{ 0 };
     std::atomic<uint64_t> selected_tensors{ 0 };
@@ -69,29 +77,38 @@ enum class qbs_support_reason {
 constexpr size_t                                         QBS_TRACE_FORMATS = 9;
 static std::array<qbs_trace_counters, QBS_TRACE_FORMATS> qbs_trace{};
 
-static qbs_profile profile_for_type(ggml_type type) {
+static qbs_encoding_pair encoding_for_type(ggml_type type) {
     switch (type) {
         case GGML_TYPE_Q4_K:
-            return { QBS_WEIGHT_PROFILE_Q4_K, QBS_ACTIVATION_PROFILE_Q8_K };
+            return { QBS_WEIGHT_ENCODING_Q4_K, QBS_ACTIVATION_ENCODING_Q8_K };
         case GGML_TYPE_Q5_K:
-            return { QBS_WEIGHT_PROFILE_Q5_K, QBS_ACTIVATION_PROFILE_Q8_K };
+            return { QBS_WEIGHT_ENCODING_Q5_K, QBS_ACTIVATION_ENCODING_Q8_K };
         case GGML_TYPE_Q6_K:
-            return { QBS_WEIGHT_PROFILE_Q6_K, QBS_ACTIVATION_PROFILE_Q8_K };
+            return { QBS_WEIGHT_ENCODING_Q6_K, QBS_ACTIVATION_ENCODING_Q8_K };
         case GGML_TYPE_Q3_K:
-            return { QBS_WEIGHT_PROFILE_Q3_K, QBS_ACTIVATION_PROFILE_Q8_K };
+            return { QBS_WEIGHT_ENCODING_Q3_K, QBS_ACTIVATION_ENCODING_Q8_K };
         case GGML_TYPE_Q8_0:
-            return { QBS_WEIGHT_PROFILE_Q8_0_WEIGHT, QBS_ACTIVATION_PROFILE_Q8_0 };
+            return { QBS_WEIGHT_ENCODING_S8_B32_F16_TWOS_COMPLEMENT,
+                     QBS_ACTIVATION_ENCODING_S8_B32_F16_TWOS_COMPLEMENT };
         case GGML_TYPE_Q4_0:
-            return { QBS_WEIGHT_PROFILE_Q4_0, QBS_ACTIVATION_PROFILE_Q8_0 };
+            return { QBS_WEIGHT_ENCODING_S4_B32_F16_SPLIT_NIBBLE_OFFSET8,
+                     QBS_ACTIVATION_ENCODING_S8_B32_F16_TWOS_COMPLEMENT };
         case GGML_TYPE_Q2_K:
-            return { QBS_WEIGHT_PROFILE_Q2_K, QBS_ACTIVATION_PROFILE_Q8_K };
+            return { QBS_WEIGHT_ENCODING_Q2_K, QBS_ACTIVATION_ENCODING_Q8_K };
         case GGML_TYPE_Q5_0:
-            return { QBS_WEIGHT_PROFILE_Q5_0, QBS_ACTIVATION_PROFILE_Q8_0 };
+            return { QBS_WEIGHT_ENCODING_S5_B32_F16_NIBBLE_HIGHBIT_OFFSET16,
+                     QBS_ACTIVATION_ENCODING_S8_B32_F16_TWOS_COMPLEMENT };
         case GGML_TYPE_IQ4_NL:
-            return { QBS_WEIGHT_PROFILE_IQ4_NL, QBS_ACTIVATION_PROFILE_Q8_0 };
+            return { QBS_WEIGHT_ENCODING_IQ4_NL, QBS_ACTIVATION_ENCODING_Q8_0 };
         default:
             return {};
     }
+}
+
+static qbs_profile profile_for_type(ggml_type type) {
+    const qbs_encoding_pair encoding = encoding_for_type(type);
+    return { qbs_weight_profile_from_encoding(encoding.weight),
+             qbs_activation_profile_from_encoding(encoding.activation) };
 }
 
 static bool env_true(const char * name) {
@@ -110,6 +127,11 @@ static bool qbs_emulation_enabled() {
 
 static bool qbs_runtime_enabled() {
     return env_true("GGML_RISCV_QBS") || qbs_emulation_enabled();
+}
+
+static bool qbs_activation_context_enabled() {
+    const char * value = std::getenv("GGML_RISCV_QBS_ACTIVATION_CONTEXT");
+    return value == nullptr || env_true("GGML_RISCV_QBS_ACTIVATION_CONTEXT");
 }
 
 static bool format_name_equal(const char * token, size_t token_size, const char * expected) {
@@ -257,7 +279,8 @@ static void print_trace_summary() {
                          "split_calls=%llu commands_m1=%llu commands_m2=%llu "
                          "commands_m3=%llu commands_m4=%llu native_qbexec=%llu "
                          "emulated_commands=%llu command_dot_elements=%llu "
-                         "segmented_commands=%llu\n",
+                         "segmented_commands=%llu context_fill=%llu "
+                         "context_reuse=%llu context_release=%llu\n",
                          trace_type_name(index), static_cast<unsigned long long>(gemv_calls),
                          static_cast<unsigned long long>(gemm_calls),
                          static_cast<unsigned long long>(counters.input_rows.load(std::memory_order_relaxed)),
@@ -271,7 +294,13 @@ static void print_trace_summary() {
                          static_cast<unsigned long long>(counters.native_qbexec.load(std::memory_order_relaxed)),
                          static_cast<unsigned long long>(counters.emulated_commands.load(std::memory_order_relaxed)),
                          static_cast<unsigned long long>(counters.command_dot_elements.load(std::memory_order_relaxed)),
-                         static_cast<unsigned long long>(counters.segmented_commands.load(std::memory_order_relaxed)));
+                         static_cast<unsigned long long>(counters.segmented_commands.load(std::memory_order_relaxed)),
+                         static_cast<unsigned long long>(
+                             counters.context_fill_commands.load(std::memory_order_relaxed)),
+                         static_cast<unsigned long long>(
+                             counters.context_reuse_commands.load(std::memory_order_relaxed)),
+                         static_cast<unsigned long long>(
+                             counters.context_release_commands.load(std::memory_order_relaxed)));
         }
     }
 }
@@ -311,7 +340,8 @@ static void record_command(ggml_type type,
                            unsigned  k_blocks,
                            unsigned  block_elements,
                            bool      emulated,
-                           bool      segmented) {
+                           bool      segmented,
+                           unsigned  activation_access) {
     if (!env_true("GGML_RISCV_QBS_TRACE")) {
         return;
     }
@@ -328,6 +358,19 @@ static void record_command(ggml_type type,
         std::memory_order_relaxed);
     if (segmented) {
         counters.segmented_commands.fetch_add(1, std::memory_order_relaxed);
+    }
+    switch (activation_access) {
+        case QBS_ACTIVATION_ACCESS_FILL:
+            counters.context_fill_commands.fetch_add(1, std::memory_order_relaxed);
+            break;
+        case QBS_ACTIVATION_ACCESS_REUSE:
+            counters.context_reuse_commands.fetch_add(1, std::memory_order_relaxed);
+            break;
+        case QBS_ACTIVATION_ACCESS_RELEASE:
+            counters.context_release_commands.fetch_add(1, std::memory_order_relaxed);
+            break;
+        default:
+            break;
     }
 }
 
@@ -351,9 +394,11 @@ static const qbs_device_t & device() {
     return value;
 }
 
-static bool profile_supported(const qbs_profile & profile) {
-    return profile.weight != QBS_WEIGHT_PROFILE_INVALID &&
-           qbs_device_supports_profile(&device(), profile.weight, profile.activation);
+static bool profile_supported(ggml_type type) {
+    const qbs_encoding_pair encoding = encoding_for_type(type);
+    qbs_profile_binding_t   binding{};
+    return encoding.weight != 0 && encoding.activation != 0 &&
+           qbs_device_bind_encodings(&device(), encoding.weight, encoding.activation, &binding) == QBS_STATUS_OK;
 }
 
 static qbs_support_reason tensor_support_reason(ggml_type type, int64_t k_elements, int64_t output_rows) {
@@ -382,7 +427,7 @@ static qbs_support_reason tensor_support_reason(ggml_type type, int64_t k_elemen
         (caps.activation_layouts & (UINT64_C(1) << QBS_ACTIVATION_LAYOUT_M4_INTERLEAVED)) == 0) {
         return qbs_support_reason::layout;
     }
-    if (!profile_supported(profile)) {
+    if (!profile_supported(type)) {
         return qbs_support_reason::profile;
     }
     return qbs_support_reason::supported;
@@ -557,10 +602,38 @@ static void emulate_qbs(ggml_type    weight_type,
 
 struct qbs_execution_context {
     ggml_type weight_type;
+    bool      emulated;
+};
+
+struct qbs_workspace_buffer {
+    static constexpr size_t LOCAL_ELEMENTS = QBS_MAX_M * 4u;
+
+    explicit qbs_workspace_buffer(size_t required_bytes) {
+        if (required_bytes == 0) {
+            return;
+        }
+        if (required_bytes <= sizeof(local)) {
+            data     = local.data();
+            capacity = sizeof(local);
+            return;
+        }
+        dynamic.resize(required_bytes / sizeof(float) + (required_bytes % sizeof(float) != 0));
+        data     = dynamic.data();
+        capacity = dynamic.size() * sizeof(dynamic[0]);
+    }
+
+    void * pointer() { return data; }
+
+    size_t size_bytes() const { return capacity; }
+
+    std::array<float, LOCAL_ELEMENTS> local;
+    std::vector<float>                dynamic;
+    void *                            data     = nullptr;
+    size_t                            capacity = 0;
 };
 
 static qbs_status_t execute_command(void *                      opaque,
-                                    const qbs_descriptor_v1_t * descriptor,
+                                    const qbs_descriptor_t *    descriptor,
                                     unsigned                    m,
                                     const void *                activations,
                                     float *                     output,
@@ -575,7 +648,7 @@ static qbs_status_t execute_command(void *                      opaque,
     }
 
     qbs_status_t status = QBS_STATUS_OK;
-    if (qbs_emulation_enabled()) {
+    if (context->emulated) {
         emulate_qbs(context->weight_type, static_cast<int>(fields.k_blocks * block_elements), output, output_stride,
                     reinterpret_cast<const void *>(descriptor->weight_base), activations, static_cast<int>(m),
                     static_cast<int>(n), fields.activation_layout == QBS_ACTIVATION_LAYOUT_M4_INTERLEAVED);
@@ -583,9 +656,43 @@ static qbs_status_t execute_command(void *                      opaque,
         status = qbs_native_execute_command(nullptr, descriptor, m, activations, output, output_stride, n, segmented);
     }
     if (status == QBS_STATUS_OK) {
-        record_command(context->weight_type, m, n, fields.k_blocks, block_elements, qbs_emulation_enabled(), segmented);
+        record_command(context->weight_type, m, n, fields.k_blocks, block_elements, context->emulated, segmented,
+                       fields.activation_access);
     }
     return status;
+}
+
+static qbs_status_t execute_plan(const qbs_plan_t &          plan,
+                                 const void *                weights,
+                                 size_t                      weight_bytes,
+                                 const void *                activations,
+                                 size_t                      activation_bytes,
+                                 float *                     output,
+                                 size_t                      output_capacity,
+                                 size_t                      output_stride,
+                                 void *                      workspace,
+                                 size_t                      workspace_bytes,
+                                 qbs_execution_context *     context) {
+    if (!qbs_activation_context_enabled() || !qbs_plan_supports_activation_context(&plan)) {
+        return qbs_execute(&plan, weights, weight_bytes, activations, activation_bytes, output, output_capacity,
+                           output_stride, workspace, workspace_bytes, execute_command, context);
+    }
+
+    // The current hardware exposes one activation context. Keep FILL through
+    // RELEASE atomic with respect to other GGML worker threads.
+    static std::mutex context_mutex;
+    static uint16_t   next_generation = 0;
+    std::lock_guard<std::mutex> lock(context_mutex);
+
+    const uint16_t generation_count = static_cast<uint16_t>(1u << plan.activation_context_generation_bits);
+    const qbs_execution_options_t options = {
+        1u,
+        { 0u, static_cast<uint8_t>(next_generation) },
+    };
+    next_generation = static_cast<uint16_t>((next_generation + 1u) % generation_count);
+    return qbs_execute_with_options(&plan, weights, weight_bytes, activations, activation_bytes, output,
+                                    output_capacity, output_stride, workspace, workspace_bytes, &options,
+                                    execute_command, context);
 }
 
 }  // namespace
@@ -718,23 +825,16 @@ void ggml_riscv_qbs_gemv(ggml_type    weight_type,
     const qbs_status_t plan_status = qbs_plan_create(&device(), &problem, &plan);
     GGML_ASSERT(plan_status == QBS_STATUS_OK);
     record_operation(weight_type, false, n, input_rows, output_rows, plan.split_k);
-    std::vector<uint32_t> workspace((plan.workspace_bytes + 3u) / 4u);
-    qbs_execution_context context{ weight_type };
-    const size_t weight_bytes = qbs_weight_storage_bytes(
-        profile.weight, QBS_WEIGHT_LAYOUT_R4_BLOCK_MAJOR,
-        static_cast<size_t>(output_rows), plan.k_blocks);
-    const size_t activation_bytes = qbs_activation_storage_bytes(
-        profile.activation, QBS_ACTIVATION_STORAGE_ROW_MAJOR,
-        static_cast<size_t>(input_rows), plan.k_blocks);
-    const size_t output_capacity =
-        static_cast<size_t>(input_rows - 1) * dst_stride +
-        static_cast<size_t>(output_rows);
-    const qbs_status_t    status =
-        qbs_execute(&plan, weights, weight_bytes, activations,
-                    activation_bytes, dst, output_capacity, dst_stride,
-                    workspace.empty() ? nullptr : workspace.data(),
-                    workspace.size() * sizeof(workspace[0]), execute_command,
-                    &context);
+    qbs_workspace_buffer  workspace(plan.workspace_bytes);
+    qbs_execution_context context{ weight_type, qbs_emulation_enabled() };
+    const size_t          weight_bytes = qbs_weight_storage_bytes(profile.weight, QBS_WEIGHT_LAYOUT_R4_BLOCK_MAJOR,
+                                                                  static_cast<size_t>(output_rows), plan.k_blocks);
+    const size_t activation_bytes = qbs_activation_storage_bytes(profile.activation, QBS_ACTIVATION_STORAGE_ROW_MAJOR,
+                                                                 static_cast<size_t>(input_rows), plan.k_blocks);
+    const size_t output_capacity  = static_cast<size_t>(input_rows - 1) * dst_stride + static_cast<size_t>(output_rows);
+    const qbs_status_t status =
+        execute_plan(plan, weights, weight_bytes, activations, activation_bytes, dst, output_capacity, dst_stride,
+                     workspace.pointer(), workspace.size_bytes(), &context);
     GGML_ASSERT(status == QBS_STATUS_OK);
 }
 
@@ -762,22 +862,15 @@ void ggml_riscv_qbs_gemm(ggml_type    weight_type,
     const qbs_status_t plan_status = qbs_plan_create(&device(), &problem, &plan);
     GGML_ASSERT(plan_status == QBS_STATUS_OK);
     record_operation(weight_type, true, n, input_rows, output_rows, plan.split_k);
-    std::vector<uint32_t> workspace((plan.workspace_bytes + 3u) / 4u);
-    qbs_execution_context context{ weight_type };
-    const size_t weight_bytes = qbs_weight_storage_bytes(
-        profile.weight, QBS_WEIGHT_LAYOUT_R4_BLOCK_MAJOR,
-        static_cast<size_t>(output_rows), plan.k_blocks);
-    const size_t activation_bytes = qbs_activation_storage_bytes(
-        profile.activation, QBS_ACTIVATION_STORAGE_M4_GROUPED,
-        static_cast<size_t>(input_rows), plan.k_blocks);
-    const size_t output_capacity =
-        static_cast<size_t>(input_rows - 1) * dst_stride +
-        static_cast<size_t>(output_rows);
-    const qbs_status_t    status =
-        qbs_execute(&plan, weights, weight_bytes, activations,
-                    activation_bytes, dst, output_capacity, dst_stride,
-                    workspace.empty() ? nullptr : workspace.data(),
-                    workspace.size() * sizeof(workspace[0]), execute_command,
-                    &context);
+    qbs_workspace_buffer  workspace(plan.workspace_bytes);
+    qbs_execution_context context{ weight_type, qbs_emulation_enabled() };
+    const size_t          weight_bytes = qbs_weight_storage_bytes(profile.weight, QBS_WEIGHT_LAYOUT_R4_BLOCK_MAJOR,
+                                                                  static_cast<size_t>(output_rows), plan.k_blocks);
+    const size_t activation_bytes = qbs_activation_storage_bytes(profile.activation, QBS_ACTIVATION_STORAGE_M4_GROUPED,
+                                                                 static_cast<size_t>(input_rows), plan.k_blocks);
+    const size_t output_capacity  = static_cast<size_t>(input_rows - 1) * dst_stride + static_cast<size_t>(output_rows);
+    const qbs_status_t status =
+        execute_plan(plan, weights, weight_bytes, activations, activation_bytes, dst, output_capacity, dst_stride,
+                     workspace.pointer(), workspace.size_bytes(), &context);
     GGML_ASSERT(status == QBS_STATUS_OK);
 }
