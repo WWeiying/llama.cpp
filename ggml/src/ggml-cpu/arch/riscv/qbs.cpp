@@ -703,6 +703,7 @@ static qbs_status_t execute_plan(const qbs_plan_t &          plan,
     const qbs_execution_options_t options = {
         1u,
         { 0u, static_cast<uint8_t>(next_generation) },
+        QBS_ACTIVATION_CONTEXT_SCOPE_OPERATION,
     };
     next_generation = static_cast<uint16_t>((next_generation + 1u) % generation_count);
     return qbs_execute_with_options(&plan, weights, weight_bytes, activations, activation_bytes, output,

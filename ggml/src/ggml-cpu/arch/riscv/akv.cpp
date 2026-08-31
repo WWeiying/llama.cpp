@@ -151,7 +151,9 @@ static int active_prefix(const ggml_tensor * mask, int64_t kv_length) {
 static support_reason supports(const ggml_compute_params * params,
                                const ggml_tensor *        dst,
                                int *                      active_kv,
-                               uint32_t *                 kernel_version) {
+                               uint32_t *                 kernel_version,
+                               uint32_t *                 q_rows,
+                               uint32_t *                 head_dim) {
     const ggml_tensor * q     = dst->src[0];
     const ggml_tensor * k     = dst->src[1];
     const ggml_tensor * v     = dst->src[2];
@@ -162,8 +164,7 @@ static support_reason supports(const ggml_compute_params * params,
         return support_reason::runtime_disabled;
     }
     const akv_capabilities_t & caps = device().capabilities;
-    if (!caps.valid || !caps.enabled || !caps.f16_payload || !caps.head_dim_128 ||
-        caps.max_q_rows < AKV_ATTENTION_KERNEL_Q_ROWS || caps.context_count == 0) {
+    if (!caps.valid || !caps.enabled || !caps.f16_payload || caps.context_count == 0) {
         return support_reason::capability;
     }
     switch (requested_kernel_policy()) {
@@ -202,19 +203,41 @@ static support_reason supports(const ggml_compute_params * params,
     }
     if (q == nullptr || k == nullptr || v == nullptr || mask == nullptr || q->type != GGML_TYPE_F32 ||
         k->type != GGML_TYPE_F16 || v->type != GGML_TYPE_F16 || mask->type != GGML_TYPE_F16 ||
-        dst->type != GGML_TYPE_F32 || q->ne[0] != AKV_HEAD_DIM_128 || q->ne[1] != 1 || q->ne[3] != 1 ||
-        k->ne[0] != AKV_HEAD_DIM_128 || v->ne[0] != AKV_HEAD_DIM_128 || k->ne[1] <= 0 || k->ne[1] != v->ne[1] ||
-        k->ne[2] <= 0 || k->ne[2] != v->ne[2] || k->ne[3] != 1 || v->ne[3] != 1 ||
-        q->ne[2] % AKV_ATTENTION_KERNEL_Q_ROWS != 0 || q->ne[2] / AKV_ATTENTION_KERNEL_Q_ROWS != k->ne[2] ||
-        dst->ne[0] != AKV_HEAD_DIM_128 || dst->ne[1] != q->ne[2] || dst->ne[2] != 1 || dst->ne[3] != 1) {
+        dst->type != GGML_TYPE_F32) {
         return support_reason::shape;
+    }
+    if ((q->ne[0] != AKV_HEAD_DIM_64 && q->ne[0] != AKV_HEAD_DIM_128) || q->ne[1] != 1 || q->ne[2] <= 0 ||
+        q->ne[3] != 1 || k->ne[0] != q->ne[0] || v->ne[0] != q->ne[0] || k->ne[1] <= 0 ||
+        k->ne[1] != v->ne[1] || k->ne[2] <= 0 || k->ne[2] != v->ne[2] || k->ne[3] != 1 || v->ne[3] != 1 ||
+        q->ne[2] % k->ne[2] != 0 || dst->ne[0] != q->ne[0] || dst->ne[1] != q->ne[2] || dst->ne[2] != 1 ||
+        dst->ne[3] != 1) {
+        return support_reason::shape;
+    }
+    const int64_t shape_q_rows = q->ne[2] / k->ne[2];
+    if (shape_q_rows <= 0 || shape_q_rows > UINT32_MAX) {
+        return support_reason::shape;
+    }
+    *q_rows  = static_cast<uint32_t>(shape_q_rows);
+    *head_dim = static_cast<uint32_t>(q->ne[0]);
+    if (*kernel_version == AKV_ATTENTION_KERNEL_VERSION_V1) {
+        if (*q_rows != AKV_ATTENTION_KERNEL_Q_ROWS || *head_dim != AKV_HEAD_DIM_128) {
+            return support_reason::shape;
+        }
+    } else if (!akv_attention_v2_shape_supported(*q_rows, *head_dim)) {
+        return support_reason::shape;
+    }
+    const bool head_dim_capable = *head_dim == AKV_HEAD_DIM_64 ? caps.head_dim_64 : caps.head_dim_128;
+    if (!head_dim_capable || caps.max_q_rows < *q_rows) {
+        return support_reason::capability;
     }
     if (q->data == nullptr || k->data == nullptr || v->data == nullptr || mask->data == nullptr ||
         dst->data == nullptr || q->nb[0] != sizeof(float) || k->nb[0] != sizeof(ggml_fp16_t) ||
         v->nb[0] != sizeof(ggml_fp16_t) || mask->nb[0] != sizeof(ggml_fp16_t) || dst->nb[0] != sizeof(float) ||
-        q->nb[2] < AKV_HEAD_DIM_128 * sizeof(float) || k->nb[1] < AKV_HEAD_DIM_128 * sizeof(ggml_fp16_t) ||
-        v->nb[1] < AKV_HEAD_DIM_128 * sizeof(ggml_fp16_t) || k->nb[1] > UINT32_MAX || v->nb[1] > UINT32_MAX ||
-        dst->nb[1] < AKV_HEAD_DIM_128 * sizeof(float) || dst->nb[1] > UINT32_MAX ||
+        q->nb[2] < static_cast<size_t>(*head_dim) * sizeof(float) ||
+        k->nb[1] < static_cast<size_t>(*head_dim) * sizeof(ggml_fp16_t) ||
+        v->nb[1] < static_cast<size_t>(*head_dim) * sizeof(ggml_fp16_t) || k->nb[1] > UINT32_MAX ||
+        v->nb[1] > UINT32_MAX || dst->nb[1] < static_cast<size_t>(*head_dim) * sizeof(float) ||
+        dst->nb[1] > UINT32_MAX ||
         (reinterpret_cast<uintptr_t>(q->data) | q->nb[2]) % alignof(float) != 0 ||
         (reinterpret_cast<uintptr_t>(k->data) | reinterpret_cast<uintptr_t>(v->data) |
          reinterpret_cast<uintptr_t>(mask->data) | k->nb[1] | v->nb[1] | k->nb[2] | v->nb[2]) %
@@ -259,29 +282,29 @@ static akv_status_t emulate(void *,
             const auto * value = reinterpret_cast<const ggml_fp16_t *>(static_cast<uintptr_t>(descriptor->v_base) +
                                                                        token * descriptor->v_token_stride_bytes);
             float        score = 0.0f;
-            ggml_vec_dot_f16(AKV_HEAD_DIM_128, &score, 0, const_cast<ggml_fp16_t *>(key), 0,
+            ggml_vec_dot_f16(descriptor->head_dim, &score, 0, const_cast<ggml_fp16_t *>(key), 0,
                              const_cast<ggml_fp16_t *>(query), 0, 1);
             score = score * scale + GGML_CPU_FP16_TO_FP32(mask[token]);
 
             if (token == 0) {
                 maximum = score;
                 sum     = 1.0f;
-                std::copy(value, value + AKV_HEAD_DIM_128, accumulator.begin());
+                std::copy(value, value + descriptor->head_dim, accumulator.begin());
                 continue;
             }
 
             const float new_maximum = std::max(maximum, score);
             const float old_factor  = std::exp(maximum - new_maximum);
             const float new_factor  = std::exp(score - new_maximum);
-            ggml_vec_scale_f16(AKV_HEAD_DIM_128, accumulator.data(), old_factor);
-            ggml_vec_mad_f16(AKV_HEAD_DIM_128, accumulator.data(), value, new_factor);
+            ggml_vec_scale_f16(descriptor->head_dim, accumulator.data(), old_factor);
+            ggml_vec_mad_f16(descriptor->head_dim, accumulator.data(), value, new_factor);
             sum     = sum * old_factor + new_factor;
             maximum = new_maximum;
         }
 
         auto *      row     = reinterpret_cast<float *>(reinterpret_cast<char *>(output) + head * output_stride);
         const float inverse = sum == 0.0f ? 0.0f : 1.0f / sum;
-        for (uint32_t element = 0; element < AKV_HEAD_DIM_128; ++element) {
+        for (uint32_t element = 0; element < descriptor->head_dim; ++element) {
             row[element] = GGML_CPU_FP16_TO_FP32(accumulator[element]) * inverse;
         }
     }
@@ -307,7 +330,9 @@ bool ggml_riscv_akv_flash_attn(const ggml_compute_params * params, ggml_tensor *
 
     int                  active_kv      = 0;
     uint32_t             kernel_version = 0;
-    const support_reason reason         = supports(params, dst, &active_kv, &kernel_version);
+    uint32_t             q_rows         = 0;
+    uint32_t             head_dim       = 0;
+    const support_reason reason = supports(params, dst, &active_kv, &kernel_version, &q_rows, &head_dim);
     if (reason != support_reason::supported) {
         if (trace_enabled && params->ith == 0) {
             trace.fallback[fallback_index(reason)].fetch_add(1, std::memory_order_relaxed);
@@ -328,17 +353,17 @@ bool ggml_riscv_akv_flash_attn(const ggml_compute_params * params, ggml_tensor *
     float               scale = 1.0f;
     std::memcpy(&scale, dst->op_params, sizeof(float));
 
-    alignas(64) std::array<ggml_fp16_t, AKV_ATTENTION_KERNEL_Q_ROWS * AKV_HEAD_DIM_128> query{};
+    alignas(64) std::array<ggml_fp16_t, AKV_MAX_Q_ROWS * AKV_HEAD_DIM_128> query{};
     alignas(AKV_DESCRIPTOR_BYTES) akv_attention_plan_t                                  plan{};
     alignas(AKV_DESCRIPTOR_BYTES) akv_attention_v2_workspace_t                          workspace{};
     const ggml_from_float_t from_float = ggml_get_type_traits_cpu(GGML_TYPE_F16)->from_float;
 
     for (int64_t kv_head = 0; kv_head < k->ne[2]; ++kv_head) {
-        const int64_t first_q_head = kv_head * AKV_ATTENTION_KERNEL_Q_ROWS;
-        for (int64_t head = 0; head < AKV_ATTENTION_KERNEL_Q_ROWS; ++head) {
+        const int64_t first_q_head = kv_head * q_rows;
+        for (uint32_t head = 0; head < q_rows; ++head) {
             const auto * source =
                 reinterpret_cast<const float *>(static_cast<const char *>(q->data) + (first_q_head + head) * q->nb[2]);
-            from_float(source, query.data() + head * AKV_HEAD_DIM_128, AKV_HEAD_DIM_128);
+            from_float(source, query.data() + head * head_dim, head_dim);
         }
 
         const akv_attention_problem_t problem = {
@@ -347,12 +372,12 @@ bool ggml_riscv_akv_flash_attn(const ggml_compute_params * params, ggml_tensor *
             reinterpret_cast<const uint16_t *>(static_cast<const char *>(v->data) + kv_head * v->nb[2]),
             static_cast<const uint16_t *>(mask->data),
             reinterpret_cast<float *>(static_cast<char *>(dst->data) + first_q_head * dst->nb[1]),
-            AKV_HEAD_DIM_128 * sizeof(ggml_fp16_t),
+            head_dim * sizeof(ggml_fp16_t),
             k->nb[1],
             v->nb[1],
             dst->nb[1],
-            AKV_ATTENTION_KERNEL_Q_ROWS,
-            AKV_HEAD_DIM_128,
+            q_rows,
+            head_dim,
             static_cast<uint32_t>(active_kv),
             scale,
         };
@@ -372,8 +397,7 @@ bool ggml_riscv_akv_flash_attn(const ggml_compute_params * params, ggml_tensor *
     if (trace_enabled) {
         const uint64_t groups         = static_cast<uint64_t>(k->ne[2]);
         const uint64_t kv_group_tokens = groups * static_cast<uint64_t>(active_kv);
-        const uint64_t attention_macs = UINT64_C(2) * kv_group_tokens * AKV_ATTENTION_KERNEL_Q_ROWS *
-                                        AKV_HEAD_DIM_128;
+        const uint64_t attention_macs = UINT64_C(2) * kv_group_tokens * q_rows * head_dim;
         trace.executed.fetch_add(1, std::memory_order_relaxed);
         trace.groups.fetch_add(groups, std::memory_order_relaxed);
         trace.kv_group_tokens.fetch_add(kv_group_tokens, std::memory_order_relaxed);
@@ -386,10 +410,11 @@ bool ggml_riscv_akv_flash_attn(const ggml_compute_params * params, ggml_tensor *
             trace.groups_v1.fetch_add(groups, std::memory_order_relaxed);
         }
         std::fprintf(stderr,
-                     "GGML_RISCV_AKV_EXEC kernel=v%u kv_heads=%llu q_rows=%llu active_kv=%d attention_macs=%llu\n",
+                     "GGML_RISCV_AKV_EXEC kernel=v%u kv_heads=%llu q_rows=%llu gqa_rows=%u head_dim=%u "
+                     "active_kv=%d attention_macs=%llu\n",
                      kernel_version,
                      static_cast<unsigned long long>(groups),
-                     static_cast<unsigned long long>(groups * AKV_ATTENTION_KERNEL_Q_ROWS), active_kv,
+                     static_cast<unsigned long long>(groups * q_rows), q_rows, head_dim, active_kv,
                      static_cast<unsigned long long>(attention_macs));
     }
     return true;
