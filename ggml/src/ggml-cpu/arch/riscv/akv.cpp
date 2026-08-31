@@ -223,6 +223,16 @@ static support_reason supports(const ggml_compute_params * params,
         (reinterpret_cast<uintptr_t>(dst->data) | dst->nb[1]) % alignof(float) != 0) {
         return support_reason::layout;
     }
+    // The v2 context writes one 128-bit fill beat into a 256-bit bank row.
+    // Query rows are copied into the aligned local buffer below; K/V bases and
+    // both strides must already satisfy the stronger descriptor contract.  Do
+    // this before any worker returns true so an unsupported layout takes the
+    // ordinary GGML path on every worker instead of failing during planning.
+    const uintptr_t v2_layout_bits = reinterpret_cast<uintptr_t>(k->data) |
+                                     reinterpret_cast<uintptr_t>(v->data) | k->nb[1] | v->nb[1] | k->nb[2] | v->nb[2];
+    if (*kernel_version == AKV_ATTENTION_KERNEL_VERSION_V2 && (v2_layout_bits & UINT64_C(31)) != 0) {
+        return support_reason::layout;
+    }
     if (mask->ne[0] < k->ne[1] || mask->ne[1] != 1 || mask->ne[2] != 1 || mask->ne[3] != 1) {
         return support_reason::mask;
     }
@@ -305,7 +315,7 @@ bool ggml_riscv_akv_flash_attn(const ggml_compute_params * params, ggml_tensor *
         return false;
     }
 
-    // AKV v1 owns one hidden context.
+    // AKV owns one hidden context.
     // Worker zero executes while other workers wait at GGML's post-node barrier.
     if (params->ith != 0) {
         return true;
