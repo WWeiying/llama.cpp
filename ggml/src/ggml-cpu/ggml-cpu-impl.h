@@ -8,6 +8,7 @@
 #include <stdlib.h> // load `stdlib.h` before other headers to work around MinGW bug: https://sourceforge.net/p/mingw-w64/bugs/192/
 //#include <stddef.h>
 #include <stdbool.h>
+#include <stdint.h>
 #include <string.h> // memcpy
 #include <math.h>   // fabsf
 
@@ -27,6 +28,14 @@ struct ggml_compute_params {
 
     // use reference implementation
     bool use_ref;
+
+    // Unique process-local identifier for this graph execution.
+    uint64_t graph_epoch;
+
+    // Current graph position. QBS uses this only to delimit explicit
+    // cross-operator activation lifetimes; ordinary CPU kernels ignore it.
+    struct ggml_cgraph * cgraph;
+    int node_index;
 };
 
 

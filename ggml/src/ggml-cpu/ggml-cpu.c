@@ -495,6 +495,8 @@ struct ggml_threadpool {
     atomic_bool pause;        // Used for pausing the threadpool or individual threads
     atomic_int  abort;        // Used for aborting processing of a graph
 
+    uint64_t graph_epoch;     // assigned before workers start each graph
+
     struct ggml_compute_state * workers;   // per thread state
     int          n_threads;   // Number of threads in the pool
     int32_t      prio;        // Scheduling priority
@@ -571,6 +573,11 @@ struct ggml_state {
 };
 
 static struct ggml_state g_state = {0};
+static atomic_uint_fast64_t g_graph_epoch = 0;
+
+#if defined(GGML_USE_RISCV_QBS)
+extern void ggml_riscv_qbs_end_graph(uint64_t graph_epoch);
+#endif
 
 void ggml_barrier(struct ggml_threadpool * tp) {
     int n_threads = atomic_load_explicit(&tp->n_graph, memory_order_relaxed) & GGML_THREADPOOL_N_THREADS_MASK;
@@ -3110,6 +3117,9 @@ static thread_ret_t ggml_graph_compute_thread(void * data) {
         /*.wdata      =*/ cplan->work_data,
         /*.threadpool =*/ tp,
         /*.use_ref    =*/ cplan->use_ref,
+        /*.graph_epoch=*/ tp->graph_epoch,
+        /*.cgraph     =*/ tp->cgraph,
+        /*.node_index =*/ -1,
     };
 
 #if defined(__riscv)
@@ -3130,6 +3140,7 @@ static thread_ret_t ggml_graph_compute_thread(void * data) {
 
     for (int node_n = 0; node_n < cgraph->n_nodes && atomic_load_explicit(&tp->abort, memory_order_relaxed) != node_n; node_n++) {
         struct ggml_tensor * node = cgraph->nodes[node_n];
+        params.node_index = node_n;
 
         if (ggml_op_is_empty(node->op)) {
             // skip NOPs
@@ -3174,6 +3185,11 @@ static thread_ret_t ggml_graph_compute_thread(void * data) {
 #endif
 
     ggml_barrier(state->threadpool);
+#if defined(GGML_USE_RISCV_QBS)
+    if (state->ith == 0) {
+        ggml_riscv_qbs_end_graph(params.graph_epoch);
+    }
+#endif
 
 #if defined(__riscv)
     if (state->ith == 0 && ggml_riscv_model_trace_enabled()) {
@@ -3343,6 +3359,7 @@ static struct ggml_threadpool * ggml_threadpool_new_impl(
         threadpool->stop             = false;
         threadpool->pause            = tpp->paused;
         threadpool->abort            = -1;
+        threadpool->graph_epoch      = 0;
         threadpool->workers          = NULL;
         threadpool->n_threads        = tpp->n_threads;
         threadpool->poll             = tpp->poll;
@@ -3430,6 +3447,9 @@ enum ggml_status ggml_graph_compute(struct ggml_cgraph * cgraph, struct ggml_cpl
         threadpool->abort            = -1;
         threadpool->ec               = GGML_STATUS_SUCCESS;
     }
+
+    threadpool->graph_epoch = atomic_fetch_add_explicit(
+        &g_graph_epoch, UINT64_C(1), memory_order_relaxed) + UINT64_C(1);
 
 #ifdef GGML_USE_OPENMP
     if (n_threads > 1) {
