@@ -3064,7 +3064,6 @@ static int ggml_cpu_try_fuse_ops(
     return 0;
 }
 
-#if defined(__riscv)
 static atomic_uint_fast64_t ggml_riscv_model_graph_sequence = 0;
 
 static bool ggml_riscv_model_trace_enabled(void) {
@@ -3079,6 +3078,10 @@ static bool ggml_riscv_model_trace_enabled(void) {
     return enabled != 0;
 }
 
+static int64_t ggml_riscv_trace_ne(const struct ggml_tensor * tensor, int axis) {
+    return tensor != NULL ? tensor->ne[axis] : 0;
+}
+
 static void ggml_riscv_trace_model_node(const struct ggml_tensor * node,
                                         int fused_followers,
                                         const struct ggml_tensor * fused_next) {
@@ -3087,15 +3090,31 @@ static void ggml_riscv_trace_model_node(const struct ggml_tensor * node,
     }
     const char * src0_type = node->src[0] != NULL ? ggml_type_name(node->src[0]->type) : "NONE";
     const char * src1_type = node->src[1] != NULL ? ggml_type_name(node->src[1]->type) : "NONE";
+    const char * src2_type = node->src[2] != NULL ? ggml_type_name(node->src[2]->type) : "NONE";
+    const char * src3_type = node->src[3] != NULL ? ggml_type_name(node->src[3]->type) : "NONE";
     const char * next_op = fused_next != NULL ? ggml_op_name(fused_next->op) : "NONE";
     fprintf(stderr,
             "GGML_RISCV_MODEL_NODE op=%s type=%s ne0=%" PRId64 " ne1=%" PRId64
             " ne2=%" PRId64 " ne3=%" PRId64 " src0=%s src1=%s "
+            "src0_ne0=%" PRId64 " src0_ne1=%" PRId64 " src0_ne2=%" PRId64 " src0_ne3=%" PRId64 " "
+            "src1_ne0=%" PRId64 " src1_ne1=%" PRId64 " src1_ne2=%" PRId64 " src1_ne3=%" PRId64 " "
+            "src2=%s src2_ne0=%" PRId64 " src2_ne1=%" PRId64 " src2_ne2=%" PRId64 " src2_ne3=%" PRId64 " "
+            "src3=%s src3_ne0=%" PRId64 " src3_ne1=%" PRId64 " src3_ne2=%" PRId64 " src3_ne3=%" PRId64 " "
             "fused_followers=%d fused_next=%s name=%s\n",
             ggml_op_name(node->op), ggml_type_name(node->type), node->ne[0], node->ne[1], node->ne[2], node->ne[3],
-            src0_type, src1_type, fused_followers, next_op, node->name[0] != '\0' ? node->name : "<unnamed>");
+            src0_type, src1_type,
+            ggml_riscv_trace_ne(node->src[0], 0), ggml_riscv_trace_ne(node->src[0], 1),
+            ggml_riscv_trace_ne(node->src[0], 2), ggml_riscv_trace_ne(node->src[0], 3),
+            ggml_riscv_trace_ne(node->src[1], 0), ggml_riscv_trace_ne(node->src[1], 1),
+            ggml_riscv_trace_ne(node->src[1], 2), ggml_riscv_trace_ne(node->src[1], 3),
+            src2_type,
+            ggml_riscv_trace_ne(node->src[2], 0), ggml_riscv_trace_ne(node->src[2], 1),
+            ggml_riscv_trace_ne(node->src[2], 2), ggml_riscv_trace_ne(node->src[2], 3),
+            src3_type,
+            ggml_riscv_trace_ne(node->src[3], 0), ggml_riscv_trace_ne(node->src[3], 1),
+            ggml_riscv_trace_ne(node->src[3], 2), ggml_riscv_trace_ne(node->src[3], 3),
+            fused_followers, next_op, node->name[0] != '\0' ? node->name : "<unnamed>");
 }
-#endif
 
 static thread_ret_t ggml_graph_compute_thread(void * data) {
     struct ggml_compute_state * state = (struct ggml_compute_state *) data;
@@ -3122,7 +3141,6 @@ static thread_ret_t ggml_graph_compute_thread(void * data) {
         /*.node_index =*/ -1,
     };
 
-#if defined(__riscv)
     uint64_t riscv_model_graph_id = 0;
     if (state->ith == 0 && ggml_riscv_model_trace_enabled()) {
         riscv_model_graph_id = atomic_fetch_add_explicit(
@@ -3130,7 +3148,6 @@ static thread_ret_t ggml_graph_compute_thread(void * data) {
         fprintf(stderr, "GGML_RISCV_MODEL_GRAPH_BEGIN id=%" PRIu64 " nodes=%d\n",
                 riscv_model_graph_id, cgraph->n_nodes);
     }
-#endif
 
 #ifdef GGML_USE_OPENMP
     GGML_PRINT_DEBUG("thread #%d compute-start cplan %p\n", state->ith, (const void *)cplan);
@@ -3154,13 +3171,11 @@ static thread_ret_t ggml_graph_compute_thread(void * data) {
         // TODO: move fused-op detection into ggml_graph_plan so fusion decisions are made once at planning time
         // Try fused ops, fall back to normal compute
         const int n_fused = ggml_cpu_try_fuse_ops(cgraph, node_n, &params, cplan);
-#if defined(__riscv)
         if (state->ith == 0) {
             const struct ggml_tensor * fused_next =
                 n_fused > 0 && node_n + 1 < cgraph->n_nodes ? cgraph->nodes[node_n + 1] : NULL;
             ggml_riscv_trace_model_node(node, n_fused, fused_next);
         }
-#endif
         if (n_fused > 0) {
             node_n += n_fused;
         } else {
@@ -3191,11 +3206,9 @@ static thread_ret_t ggml_graph_compute_thread(void * data) {
     }
 #endif
 
-#if defined(__riscv)
     if (state->ith == 0 && ggml_riscv_model_trace_enabled()) {
         fprintf(stderr, "GGML_RISCV_MODEL_GRAPH_END id=%" PRIu64 "\n", riscv_model_graph_id);
     }
-#endif
 
 #ifdef GGML_USE_CPU_RISCV64_SPACEMIT
     ggml_backend_cpu_riscv64_spacemit_clear_numa_thread_affinity_threaded(state->ith);
