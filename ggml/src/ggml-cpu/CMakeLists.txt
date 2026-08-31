@@ -484,7 +484,9 @@ function(ggml_add_cpu_backend_variant_impl tag_name)
                 ggml-cpu/arch/riscv/akv.h
                 ${GGML_RISCV_AKV_RUNTIME_DIR}/src/akv_runtime.c
                 ${GGML_RISCV_AKV_RUNTIME_DIR}/src/akv_native_riscv.c
+                ${GGML_RISCV_AKV_RUNTIME_DIR}/src/akv_v2_native_riscv.c
                 ${GGML_RISCV_AKV_RUNTIME_DIR}/src/akv_attention_rvv.S
+                ${GGML_RISCV_AKV_RUNTIME_DIR}/src/akv_v2_attention_rvv.S
                 )
         endif()
         if (GGML_CPU_RISCV64_SPACEMIT)

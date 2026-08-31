@@ -35,6 +35,8 @@ struct qbs_trace_counters {
     std::atomic<uint64_t>                        gemm_calls{ 0 };
     std::atomic<uint64_t>                        input_rows{ 0 };
     std::atomic<uint64_t>                        output_rows{ 0 };
+    std::atomic<uint64_t>                        activation_elements{ 0 };
+    std::atomic<uint64_t>                        output_elements{ 0 };
     std::atomic<uint64_t>                        dot_elements{ 0 };
     std::atomic<uint64_t>                        split_calls{ 0 };
     std::array<std::atomic<uint64_t>, QBS_MAX_M> commands_by_m{};
@@ -275,7 +277,8 @@ static void print_trace_summary() {
         if (gemv_calls != 0 || gemm_calls != 0) {
             std::fprintf(stderr,
                          "GGML_RISCV_QBS_EXEC type=%s gemv_calls=%llu gemm_calls=%llu "
-                         "input_rows=%llu output_rows=%llu dot_elements=%llu "
+                         "input_rows=%llu output_rows=%llu activation_elements=%llu "
+                         "output_elements=%llu dot_elements=%llu "
                          "split_calls=%llu commands_m1=%llu commands_m2=%llu "
                          "commands_m3=%llu commands_m4=%llu native_qbexec=%llu "
                          "emulated_commands=%llu command_dot_elements=%llu "
@@ -285,6 +288,9 @@ static void print_trace_summary() {
                          static_cast<unsigned long long>(gemm_calls),
                          static_cast<unsigned long long>(counters.input_rows.load(std::memory_order_relaxed)),
                          static_cast<unsigned long long>(counters.output_rows.load(std::memory_order_relaxed)),
+                         static_cast<unsigned long long>(
+                             counters.activation_elements.load(std::memory_order_relaxed)),
+                         static_cast<unsigned long long>(counters.output_elements.load(std::memory_order_relaxed)),
                          static_cast<unsigned long long>(counters.dot_elements.load(std::memory_order_relaxed)),
                          static_cast<unsigned long long>(counters.split_calls.load(std::memory_order_relaxed)),
                          static_cast<unsigned long long>(counters.commands_by_m[0].load(std::memory_order_relaxed)),
@@ -326,11 +332,20 @@ static void record_operation(ggml_type type, bool gemm, int n, int input_rows, i
     (gemm ? counters.gemm_calls : counters.gemv_calls).fetch_add(1, std::memory_order_relaxed);
     counters.input_rows.fetch_add(static_cast<uint64_t>(input_rows), std::memory_order_relaxed);
     counters.output_rows.fetch_add(static_cast<uint64_t>(output_rows), std::memory_order_relaxed);
+    counters.activation_elements.fetch_add(
+        static_cast<uint64_t>(n) * static_cast<uint64_t>(input_rows), std::memory_order_relaxed);
+    counters.output_elements.fetch_add(
+        static_cast<uint64_t>(input_rows) * static_cast<uint64_t>(output_rows), std::memory_order_relaxed);
     counters.dot_elements.fetch_add(
         static_cast<uint64_t>(n) * static_cast<uint64_t>(input_rows) * static_cast<uint64_t>(output_rows),
         std::memory_order_relaxed);
     if (split_k) {
         counters.split_calls.fetch_add(1, std::memory_order_relaxed);
+    }
+    if (env_true("GGML_RISCV_QBS_TRACE_CALLS")) {
+        std::fprintf(stderr,
+                     "GGML_RISCV_QBS_CALL type=%s mode=%s k=%d input_rows=%d output_rows=%d split_k=%d\n",
+                     ggml_type_name(type), gemm ? "gemm" : "gemv", n, input_rows, output_rows, split_k);
     }
 }
 

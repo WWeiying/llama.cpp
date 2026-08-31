@@ -29,7 +29,20 @@ struct trace_counters {
     std::atomic<uint64_t>                candidates{};
     std::atomic<uint64_t>                executed{};
     std::atomic<uint64_t>                groups{};
+    std::atomic<uint64_t>                executed_v1{};
+    std::atomic<uint64_t>                executed_v2{};
+    std::atomic<uint64_t>                groups_v1{};
+    std::atomic<uint64_t>                groups_v2{};
+    std::atomic<uint64_t>                kv_group_tokens{};
+    std::atomic<uint64_t>                attention_macs{};
     std::array<std::atomic<uint64_t>, 7> fallback{};
+};
+
+enum class kernel_policy {
+    automatic,
+    v1,
+    v2,
+    invalid,
 };
 
 static trace_counters trace;
@@ -52,17 +65,39 @@ static bool runtime_enabled() {
     return env_true("GGML_RISCV_AKV") || emulation_enabled();
 }
 
+static kernel_policy requested_kernel_policy() {
+    const char * value = std::getenv("GGML_RISCV_AKV_KERNEL");
+    if (value == nullptr || value[0] == '\0' || std::strcmp(value, "auto") == 0) {
+        return kernel_policy::automatic;
+    }
+    if (std::strcmp(value, "1") == 0 || std::strcmp(value, "v1") == 0 || std::strcmp(value, "V1") == 0) {
+        return kernel_policy::v1;
+    }
+    if (std::strcmp(value, "2") == 0 || std::strcmp(value, "v2") == 0 || std::strcmp(value, "V2") == 0) {
+        return kernel_policy::v2;
+    }
+    return kernel_policy::invalid;
+}
+
 static void report_trace() {
     if (!env_true("GGML_RISCV_AKV_TRACE")) {
         return;
     }
     std::fprintf(stderr,
                  "GGML_RISCV_AKV_COVERAGE candidate_ops=%llu executed_ops=%llu groups=%llu "
+                 "executed_v1=%llu executed_v2=%llu groups_v1=%llu groups_v2=%llu "
+                 "kv_group_tokens=%llu attention_macs=%llu "
                  "fallback_runtime=%llu fallback_capability=%llu fallback_threading=%llu "
                  "fallback_feature=%llu fallback_shape=%llu fallback_layout=%llu fallback_mask=%llu\n",
                  static_cast<unsigned long long>(trace.candidates.load()),
                  static_cast<unsigned long long>(trace.executed.load()),
                  static_cast<unsigned long long>(trace.groups.load()),
+                 static_cast<unsigned long long>(trace.executed_v1.load()),
+                 static_cast<unsigned long long>(trace.executed_v2.load()),
+                 static_cast<unsigned long long>(trace.groups_v1.load()),
+                 static_cast<unsigned long long>(trace.groups_v2.load()),
+                 static_cast<unsigned long long>(trace.kv_group_tokens.load()),
+                 static_cast<unsigned long long>(trace.attention_macs.load()),
                  static_cast<unsigned long long>(trace.fallback[0].load()),
                  static_cast<unsigned long long>(trace.fallback[1].load()),
                  static_cast<unsigned long long>(trace.fallback[2].load()),
@@ -113,7 +148,10 @@ static int active_prefix(const ggml_tensor * mask, int64_t kv_length) {
     return active > 0 && active <= UINT16_MAX ? static_cast<int>(active) : -1;
 }
 
-static support_reason supports(const ggml_compute_params * params, const ggml_tensor * dst, int * active_kv) {
+static support_reason supports(const ggml_compute_params * params,
+                               const ggml_tensor *        dst,
+                               int *                      active_kv,
+                               uint32_t *                 kernel_version) {
     const ggml_tensor * q     = dst->src[0];
     const ggml_tensor * k     = dst->src[1];
     const ggml_tensor * v     = dst->src[2];
@@ -127,6 +165,26 @@ static support_reason supports(const ggml_compute_params * params, const ggml_te
     if (!caps.valid || !caps.enabled || !caps.f16_payload || !caps.head_dim_128 ||
         caps.max_q_rows < AKV_ATTENTION_KERNEL_Q_ROWS || caps.context_count == 0) {
         return support_reason::capability;
+    }
+    switch (requested_kernel_policy()) {
+        case kernel_policy::automatic:
+            *kernel_version = caps.token_axis_valid && caps.token_axis_enabled && caps.token_axis_tail &&
+                                      caps.token_axis_row_view
+                                  ? AKV_ATTENTION_KERNEL_VERSION_V2
+                                  : AKV_ATTENTION_KERNEL_VERSION_V1;
+            break;
+        case kernel_policy::v1:
+            *kernel_version = AKV_ATTENTION_KERNEL_VERSION_V1;
+            break;
+        case kernel_policy::v2:
+            if (!caps.token_axis_valid || !caps.token_axis_enabled || !caps.token_axis_tail ||
+                !caps.token_axis_row_view) {
+                return support_reason::capability;
+            }
+            *kernel_version = AKV_ATTENTION_KERNEL_VERSION_V2;
+            break;
+        case kernel_policy::invalid:
+            return support_reason::feature;
     }
     if (params->nth <= 0 || params->ith < 0 || params->ith >= params->nth) {
         return support_reason::threading;
@@ -220,7 +278,11 @@ static akv_status_t emulate(void *,
     return AKV_STATUS_OK;
 }
 
-static akv_status_t execute(const akv_attention_plan_t * plan) {
+static akv_status_t execute(const akv_attention_plan_t * plan, akv_attention_v2_workspace_t * workspace) {
+    if (plan->kernel_version == AKV_ATTENTION_KERNEL_VERSION_V2) {
+        return emulation_enabled() ? akv_attention_execute_v2(plan, emulate, nullptr)
+                                   : akv_attention_execute_v2_native(plan, workspace);
+    }
     return emulation_enabled() ? akv_attention_execute(plan, emulate, nullptr) : akv_attention_execute_native(plan);
 }
 
@@ -233,8 +295,9 @@ bool ggml_riscv_akv_flash_attn(const ggml_compute_params * params, ggml_tensor *
         trace.candidates.fetch_add(1, std::memory_order_relaxed);
     }
 
-    int                  active_kv = 0;
-    const support_reason reason    = supports(params, dst, &active_kv);
+    int                  active_kv      = 0;
+    uint32_t             kernel_version = 0;
+    const support_reason reason         = supports(params, dst, &active_kv, &kernel_version);
     if (reason != support_reason::supported) {
         if (trace_enabled && params->ith == 0) {
             trace.fallback[fallback_index(reason)].fetch_add(1, std::memory_order_relaxed);
@@ -257,6 +320,7 @@ bool ggml_riscv_akv_flash_attn(const ggml_compute_params * params, ggml_tensor *
 
     alignas(64) std::array<ggml_fp16_t, AKV_ATTENTION_KERNEL_Q_ROWS * AKV_HEAD_DIM_128> query{};
     alignas(AKV_DESCRIPTOR_BYTES) akv_attention_plan_t                                  plan{};
+    alignas(AKV_DESCRIPTOR_BYTES) akv_attention_v2_workspace_t                          workspace{};
     const ggml_from_float_t from_float = ggml_get_type_traits_cpu(GGML_TYPE_F16)->from_float;
 
     for (int64_t kv_head = 0; kv_head < k->ne[2]; ++kv_head) {
@@ -282,19 +346,41 @@ bool ggml_riscv_akv_flash_attn(const ggml_compute_params * params, ggml_tensor *
             static_cast<uint32_t>(active_kv),
             scale,
         };
-        const akv_status_t plan_status = akv_attention_plan_create(&device(), &problem, &plan);
+        const akv_status_t plan_status =
+            kernel_version == AKV_ATTENTION_KERNEL_VERSION_V2
+                ? akv_attention_plan_create_v2(&device(), &problem, &plan)
+                : akv_attention_plan_create(&device(), &problem, &plan);
         if (plan_status != AKV_STATUS_OK) {
             GGML_ABORT("AKV plan creation failed: %s", akv_status_string(plan_status));
         }
-        const akv_status_t execute_status = execute(&plan);
+        const akv_status_t execute_status = execute(&plan, &workspace);
         if (execute_status != AKV_STATUS_OK) {
             GGML_ABORT("AKV execution failed: %s", akv_status_string(execute_status));
         }
     }
 
     if (trace_enabled) {
+        const uint64_t groups         = static_cast<uint64_t>(k->ne[2]);
+        const uint64_t kv_group_tokens = groups * static_cast<uint64_t>(active_kv);
+        const uint64_t attention_macs = UINT64_C(2) * kv_group_tokens * AKV_ATTENTION_KERNEL_Q_ROWS *
+                                        AKV_HEAD_DIM_128;
         trace.executed.fetch_add(1, std::memory_order_relaxed);
-        trace.groups.fetch_add(k->ne[2], std::memory_order_relaxed);
+        trace.groups.fetch_add(groups, std::memory_order_relaxed);
+        trace.kv_group_tokens.fetch_add(kv_group_tokens, std::memory_order_relaxed);
+        trace.attention_macs.fetch_add(attention_macs, std::memory_order_relaxed);
+        if (kernel_version == AKV_ATTENTION_KERNEL_VERSION_V2) {
+            trace.executed_v2.fetch_add(1, std::memory_order_relaxed);
+            trace.groups_v2.fetch_add(groups, std::memory_order_relaxed);
+        } else {
+            trace.executed_v1.fetch_add(1, std::memory_order_relaxed);
+            trace.groups_v1.fetch_add(groups, std::memory_order_relaxed);
+        }
+        std::fprintf(stderr,
+                     "GGML_RISCV_AKV_EXEC kernel=v%u kv_heads=%llu q_rows=%llu active_kv=%d attention_macs=%llu\n",
+                     kernel_version,
+                     static_cast<unsigned long long>(groups),
+                     static_cast<unsigned long long>(groups * AKV_ATTENTION_KERNEL_Q_ROWS), active_kv,
+                     static_cast<unsigned long long>(attention_macs));
     }
     return true;
 }
