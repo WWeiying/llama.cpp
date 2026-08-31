@@ -1,5 +1,6 @@
 #include "qbs.h"
 
+#include "ggml-cpu-impl.h"
 #include "ggml-quants.h"
 #include "qbs/qbs.h"
 #include "quants.h"
@@ -9,6 +10,7 @@
 #include <atomic>
 #include <cassert>
 #include <cctype>
+#include <condition_variable>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
@@ -82,14 +84,23 @@ static std::array<qbs_trace_counters, QBS_TRACE_FORMATS> qbs_trace{};
 
 struct qbs_activation_trace_record {
     uint64_t             sequence;
+    uint64_t             graph_epoch;
     const void *         source_tensor_identity;
     const void *         source_data;
     ggml_type            activation_type;
     int64_t              activation_rows;
     int64_t              k_elements;
+    int64_t              output_rows;
     uint64_t             digest;
     std::string          weight_name;
     std::vector<uint8_t> quantized_data;
+};
+
+struct qbs_activation_trace_link {
+    uint64_t  graph_epoch        = 0;
+    uint64_t  activation_sequence = 0;
+    uintptr_t quantized_begin    = 0;
+    uintptr_t quantized_end      = 0;
 };
 
 struct qbs_activation_trace_state {
@@ -104,7 +115,16 @@ struct qbs_activation_trace_state {
     uint64_t                                quantize_time_us        = 0;
     uint64_t                                reusable_quantize_time_us = 0;
     size_t                                  retained_snapshot_bytes  = 0;
+    std::unordered_set<uint64_t>            graph_epochs;
 };
+
+static thread_local qbs_activation_trace_link current_activation_trace_link;
+static std::atomic<uint64_t>                 lifetime_command_sequence{ 0 };
+static std::atomic<uint64_t>                 cross_op_fill_calls{ 0 };
+static std::atomic<uint64_t>                 cross_op_reuse_calls{ 0 };
+static std::atomic<uint64_t>                 cross_op_release_calls{ 0 };
+static std::atomic<uint64_t>                 cross_op_quantization_skips{ 0 };
+static std::atomic<uint64_t>                 cross_op_activation_bytes_saved{ 0 };
 
 static qbs_activation_trace_state & activation_trace_state() {
     static auto * state = new qbs_activation_trace_state;
@@ -138,14 +158,23 @@ static void print_activation_trace_summary() {
                  "GGML_RISCV_QBS_LIFETIME_SUMMARY quantizations=%llu "
                  "exact_reuse_candidates=%llu quantized_bytes=%llu "
                  "reusable_quantized_bytes=%llu quantizations_with_time=%llu "
-                 "quantize_time_us=%llu reusable_quantize_time_us=%llu\n",
+                 "quantize_time_us=%llu reusable_quantize_time_us=%llu "
+                 "graph_epochs=%zu cross_op_fill=%llu cross_op_reuse=%llu "
+                 "cross_op_release=%llu cross_op_quantization_skips=%llu "
+                 "cross_op_activation_bytes_saved=%llu\n",
                  static_cast<unsigned long long>(state.quantizations),
                  static_cast<unsigned long long>(state.exact_reuse_candidates),
                  static_cast<unsigned long long>(state.quantized_bytes),
                  static_cast<unsigned long long>(state.reusable_quantized_bytes),
                  static_cast<unsigned long long>(state.quantizations_with_time),
                  static_cast<unsigned long long>(state.quantize_time_us),
-                 static_cast<unsigned long long>(state.reusable_quantize_time_us));
+                 static_cast<unsigned long long>(state.reusable_quantize_time_us),
+                 state.graph_epochs.size(),
+                 static_cast<unsigned long long>(cross_op_fill_calls.load(std::memory_order_relaxed)),
+                 static_cast<unsigned long long>(cross_op_reuse_calls.load(std::memory_order_relaxed)),
+                 static_cast<unsigned long long>(cross_op_release_calls.load(std::memory_order_relaxed)),
+                 static_cast<unsigned long long>(cross_op_quantization_skips.load(std::memory_order_relaxed)),
+                 static_cast<unsigned long long>(cross_op_activation_bytes_saved.load(std::memory_order_relaxed)));
 }
 
 static void ensure_activation_trace_registered() {
@@ -413,14 +442,15 @@ static void record_operation(ggml_type type, bool gemm, int n, int input_rows, i
     }
 }
 
-static void record_command(ggml_type type,
-                           unsigned  m,
-                           unsigned  n,
-                           unsigned  k_blocks,
-                           unsigned  block_elements,
-                           bool      emulated,
-                           bool      segmented,
-                           unsigned  activation_access) {
+static void record_command(ggml_type                      type,
+                           unsigned                       m,
+                           unsigned                       n,
+                           const qbs_descriptor_fields_t & fields,
+                           unsigned                       block_elements,
+                           bool                           emulated,
+                           bool                           segmented,
+                           uint64_t                       graph_epoch,
+                           uint64_t                       activation_sequence) {
     if (!env_true("GGML_RISCV_QBS_TRACE")) {
         return;
     }
@@ -433,12 +463,12 @@ static void record_command(ggml_type type,
     counters.commands_by_m[m - 1].fetch_add(1, std::memory_order_relaxed);
     (emulated ? counters.emulated_commands : counters.native_qbexec).fetch_add(1, std::memory_order_relaxed);
     counters.command_dot_elements.fetch_add(
-        static_cast<uint64_t>(m) * static_cast<uint64_t>(n) * static_cast<uint64_t>(k_blocks) * block_elements,
+        static_cast<uint64_t>(m) * static_cast<uint64_t>(n) * static_cast<uint64_t>(fields.k_blocks) * block_elements,
         std::memory_order_relaxed);
     if (segmented) {
         counters.segmented_commands.fetch_add(1, std::memory_order_relaxed);
     }
-    switch (activation_access) {
+    switch (fields.activation_access) {
         case QBS_ACTIVATION_ACCESS_FILL:
             counters.context_fill_commands.fetch_add(1, std::memory_order_relaxed);
             break;
@@ -450,6 +480,20 @@ static void record_command(ggml_type type,
             break;
         default:
             break;
+    }
+
+    if (ggml_riscv_qbs_trace_activation_lifetime_enabled()) {
+        const uint64_t command_sequence = lifetime_command_sequence.fetch_add(1, std::memory_order_relaxed) + 1;
+        std::fprintf(stderr,
+                     "GGML_RISCV_QBS_COMMAND seq=%llu graph_epoch=%llu activation_seq=%llu linked=%d "
+                     "weight_type=%s weight_profile=%u activation_profile=%u m=%u n=%u k_blocks=%u "
+                     "access=%u context_id=%u context_generation=%u segmented=%d emulated=%d\n",
+                     static_cast<unsigned long long>(command_sequence),
+                     static_cast<unsigned long long>(graph_epoch),
+                     static_cast<unsigned long long>(activation_sequence),
+                     graph_epoch != 0 && activation_sequence != 0, ggml_type_name(type), fields.weight_profile,
+                     fields.activation_profile, m, n, fields.k_blocks, fields.activation_access, fields.context_id,
+                     fields.context_generation, segmented, emulated);
     }
 }
 
@@ -682,7 +726,158 @@ static void emulate_qbs(ggml_type    weight_type,
 struct qbs_execution_context {
     ggml_type weight_type;
     bool      emulated;
+    uint64_t  graph_epoch;
+    uint64_t  activation_sequence;
 };
+
+enum class qbs_cross_op_scope : uint8_t {
+    none,
+    fill_keep,
+    reuse_keep,
+    reuse_release,
+};
+
+struct qbs_cross_op_identity {
+    uint64_t            graph_epoch       = 0;
+    const ggml_tensor * source_tensor     = nullptr;
+    const void *        source_data       = nullptr;
+    unsigned            activation_profile = QBS_ACTIVATION_PROFILE_INVALID;
+    int64_t             activation_rows   = 0;
+    int64_t             k_elements        = 0;
+};
+
+struct qbs_cross_op_request {
+    qbs_cross_op_scope   scope = qbs_cross_op_scope::none;
+    qbs_cross_op_identity identity{};
+    uint8_t              generation          = 0;
+    uint64_t             activation_sequence = 0;
+    size_t               activation_bytes    = 0;
+};
+
+struct qbs_cross_op_state {
+    std::mutex              mutex;
+    std::condition_variable available;
+    bool                    reserved = false;
+    bool                    resident = false;
+    qbs_cross_op_identity   owner{};
+    uint8_t                 generation          = 0;
+    uint16_t                next_generation     = 0;
+    uint64_t                activation_sequence = 0;
+};
+
+static thread_local qbs_cross_op_request current_cross_op_request;
+
+static qbs_cross_op_state & cross_op_state() {
+    static auto * state = new qbs_cross_op_state;
+    return *state;
+}
+
+static bool same_cross_op_identity(const qbs_cross_op_identity & lhs, const qbs_cross_op_identity & rhs) {
+    return lhs.graph_epoch == rhs.graph_epoch && lhs.source_tensor == rhs.source_tensor &&
+           lhs.source_data == rhs.source_data && lhs.activation_profile == rhs.activation_profile &&
+           lhs.activation_rows == rhs.activation_rows && lhs.k_elements == rhs.k_elements;
+}
+
+static const char * cross_op_scope_name(qbs_cross_op_scope scope) {
+    switch (scope) {
+        case qbs_cross_op_scope::fill_keep:
+            return "fill_keep";
+        case qbs_cross_op_scope::reuse_keep:
+            return "reuse_keep";
+        case qbs_cross_op_scope::reuse_release:
+            return "reuse_release";
+        case qbs_cross_op_scope::none:
+            return "operation";
+    }
+    return "invalid";
+}
+
+static bool qbs_cross_op_context_enabled() {
+    const char * value = std::getenv("GGML_RISCV_QBS_CROSS_OP_CONTEXT");
+    return qbs_activation_context_enabled() && !qbs_emulation_enabled() &&
+           (value == nullptr || env_true("GGML_RISCV_QBS_CROSS_OP_CONTEXT"));
+}
+
+static uint8_t allocate_context_generation(qbs_cross_op_state & state, unsigned generation_bits) {
+    const uint16_t generation_count = static_cast<uint16_t>(1u << generation_bits);
+    const uint8_t generation = static_cast<uint8_t>(state.next_generation);
+    state.next_generation = static_cast<uint16_t>((state.next_generation + 1u) % generation_count);
+    return generation;
+}
+
+static bool context_plan_supported(ggml_type weight_type, int64_t k_elements, int64_t output_rows) {
+    const qbs_profile profile = profile_for_type(weight_type);
+    if (profile.activation != QBS_ACTIVATION_PROFILE_Q8_K || k_elements <= 0 || output_rows <= 0 ||
+        k_elements > std::numeric_limits<uint32_t>::max() || output_rows > std::numeric_limits<uint32_t>::max()) {
+        return false;
+    }
+    const qbs_problem_t problem = {
+        static_cast<uint8_t>(profile.weight),
+        static_cast<uint8_t>(profile.activation),
+        static_cast<uint8_t>(QBS_WEIGHT_LAYOUT_R4_BLOCK_MAJOR),
+        static_cast<uint8_t>(QBS_ACTIVATION_STORAGE_ROW_MAJOR),
+        1u,
+        static_cast<uint32_t>(output_rows),
+        static_cast<uint32_t>(k_elements),
+    };
+    qbs_plan_t plan{};
+    return qbs_plan_create(&device(), &problem, &plan) == QBS_STATUS_OK &&
+           qbs_plan_supports_activation_context(&plan);
+}
+
+static bool context_identity_for_node(const ggml_tensor * node,
+                                      uint64_t            graph_epoch,
+                                      qbs_cross_op_identity * identity) {
+    if (node == nullptr || identity == nullptr || node->op != GGML_OP_MUL_MAT || node->src[0] == nullptr ||
+        node->src[1] == nullptr || node->src[1]->type != GGML_TYPE_F32) {
+        return false;
+    }
+    const ggml_tensor * weights    = node->src[0];
+    const ggml_tensor * activation = node->src[1];
+    const int64_t       rows       = ggml_nrows(activation);
+    const int64_t       k_elements = activation->ne[0];
+    const int64_t       output_rows = weights->ne[1];
+    const qbs_profile   profile     = profile_for_type(weights->type);
+    if (rows != 1 || profile.activation != QBS_ACTIVATION_PROFILE_Q8_K ||
+        tensor_support_reason(weights->type, k_elements, output_rows) != qbs_support_reason::supported ||
+        !context_plan_supported(weights->type, k_elements, output_rows)) {
+        return false;
+    }
+    *identity = {
+        graph_epoch,
+        activation,
+        activation->data,
+        profile.activation,
+        rows,
+        k_elements,
+    };
+    return true;
+}
+
+static bool next_context_consumer_matches(const ggml_compute_params * params,
+                                          const qbs_cross_op_identity & current) {
+    if (params->cgraph == nullptr || params->node_index < 0) {
+        return false;
+    }
+    const int node_count = ggml_graph_n_nodes(params->cgraph);
+    for (int node_index = params->node_index + 1; node_index < node_count; ++node_index) {
+        qbs_cross_op_identity next{};
+        if (!context_identity_for_node(ggml_graph_node(params->cgraph, node_index), params->graph_epoch, &next)) {
+            continue;
+        }
+        return same_cross_op_identity(current, next);
+    }
+    return false;
+}
+
+static qbs_activation_trace_link linked_activation(const void * activation) {
+    const uintptr_t address = reinterpret_cast<uintptr_t>(activation);
+    if (address < current_activation_trace_link.quantized_begin ||
+        address >= current_activation_trace_link.quantized_end) {
+        return {};
+    }
+    return current_activation_trace_link;
+}
 
 struct qbs_workspace_buffer {
     static constexpr size_t LOCAL_ELEMENTS = QBS_MAX_M * 4u;
@@ -735,8 +930,8 @@ static qbs_status_t execute_command(void *                      opaque,
         status = qbs_native_execute_command(nullptr, descriptor, m, activations, output, output_stride, n, segmented);
     }
     if (status == QBS_STATUS_OK) {
-        record_command(context->weight_type, m, n, fields.k_blocks, block_elements, context->emulated, segmented,
-                       fields.activation_access);
+        record_command(context->weight_type, m, n, fields, block_elements, context->emulated, segmented,
+                       context->graph_epoch, context->activation_sequence);
     }
     return status;
 }
@@ -753,28 +948,207 @@ static qbs_status_t execute_plan(const qbs_plan_t &          plan,
                                  size_t                      workspace_bytes,
                                  qbs_execution_context *     context) {
     if (!qbs_activation_context_enabled() || !qbs_plan_supports_activation_context(&plan)) {
+        GGML_ASSERT(current_cross_op_request.scope == qbs_cross_op_scope::none);
         return qbs_execute(&plan, weights, weight_bytes, activations, activation_bytes, output, output_capacity,
                            output_stride, workspace, workspace_bytes, execute_command, context);
     }
 
-    // The current hardware exposes one activation context. Keep FILL through
-    // RELEASE atomic with respect to other GGML worker threads.
-    static std::mutex context_mutex;
-    static uint16_t   next_generation = 0;
-    std::lock_guard<std::mutex> lock(context_mutex);
+    // The hardware exposes one context. A condition-backed reservation keeps
+    // one graph's explicit cross-operator lifetime from being displaced by an
+    // unrelated worker while retaining the original per-operation scope for
+    // all calls that do not opt into cross-operator reuse.
+    auto & state = cross_op_state();
+    std::unique_lock<std::mutex> lock(state.mutex);
+    const bool cross_op = current_cross_op_request.scope != qbs_cross_op_scope::none;
+    if (cross_op) {
+        if (!state.reserved || !same_cross_op_identity(state.owner, current_cross_op_request.identity) ||
+            state.generation != current_cross_op_request.generation) {
+            current_cross_op_request = {};
+            return QBS_STATUS_CONTEXT_TOKEN;
+        }
+    } else {
+        state.available.wait(lock, [&] { return !state.reserved; });
+    }
 
-    const uint16_t generation_count = static_cast<uint16_t>(1u << plan.activation_context_generation_bits);
-    const qbs_execution_options_t options = {
-        1u,
-        { 0u, static_cast<uint8_t>(next_generation) },
-    };
-    next_generation = static_cast<uint16_t>((next_generation + 1u) % generation_count);
-    return qbs_execute_with_options(&plan, weights, weight_bytes, activations, activation_bytes, output,
-                                    output_capacity, output_stride, workspace, workspace_bytes, &options,
-                                    execute_command, context);
+    qbs_execution_options_t options{};
+    options.use_activation_context = 1u;
+    options.activation_context.context_id = 0u;
+    if (cross_op) {
+        options.activation_context.generation = current_cross_op_request.generation;
+        switch (current_cross_op_request.scope) {
+            case qbs_cross_op_scope::fill_keep:
+                options.activation_context_scope = QBS_ACTIVATION_CONTEXT_SCOPE_FILL_KEEP;
+                break;
+            case qbs_cross_op_scope::reuse_keep:
+                GGML_ASSERT(state.resident);
+                options.activation_context_scope = QBS_ACTIVATION_CONTEXT_SCOPE_REUSE_KEEP;
+                break;
+            case qbs_cross_op_scope::reuse_release:
+                GGML_ASSERT(state.resident);
+                options.activation_context_scope = QBS_ACTIVATION_CONTEXT_SCOPE_REUSE_RELEASE;
+                break;
+            case qbs_cross_op_scope::none:
+                GGML_ABORT("invalid QBS cross-operator scope");
+        }
+    } else {
+        options.activation_context.generation =
+            allocate_context_generation(state, plan.activation_context_generation_bits);
+        options.activation_context_scope = QBS_ACTIVATION_CONTEXT_SCOPE_OPERATION;
+    }
+
+    const qbs_status_t status = qbs_execute_with_options(
+        &plan, weights, weight_bytes, activations, activation_bytes, output, output_capacity, output_stride,
+        workspace, workspace_bytes, &options, execute_command, context);
+
+    bool notify = false;
+    if (cross_op) {
+        if (status != QBS_STATUS_OK) {
+            state.reserved = false;
+            state.resident = false;
+            state.activation_sequence = 0;
+            notify = true;
+        } else if (current_cross_op_request.scope == qbs_cross_op_scope::fill_keep) {
+            state.resident = true;
+        } else if (current_cross_op_request.scope == qbs_cross_op_scope::reuse_release) {
+            state.reserved = false;
+            state.resident = false;
+            state.activation_sequence = 0;
+            notify = true;
+        }
+    }
+    current_cross_op_request = {};
+    lock.unlock();
+    if (notify) {
+        state.available.notify_all();
+    }
+    return status;
 }
 
 }  // namespace
+
+bool ggml_riscv_qbs_prepare_activation_context(const ggml_compute_params * params,
+                                               const ggml_tensor *         op,
+                                               ggml_type                   activation_type,
+                                               int64_t                     activation_rows,
+                                               int64_t                     k_elements) {
+    current_cross_op_request      = {};
+    current_activation_trace_link = {};
+    if (params == nullptr || op == nullptr || params->nth != 1 || params->ith != 0 ||
+        !qbs_cross_op_context_enabled()) {
+        return false;
+    }
+
+    qbs_cross_op_identity identity{};
+    if (!context_identity_for_node(op, params->graph_epoch, &identity) || activation_type != GGML_TYPE_Q8_K ||
+        identity.activation_rows != activation_rows || identity.k_elements != k_elements) {
+        return false;
+    }
+    const bool keep_for_next = next_context_consumer_matches(params, identity);
+    const unsigned generation_bits = device().capabilities.activation_context_generation_bits;
+    GGML_ASSERT(generation_bits > 0 && generation_bits <= 8);
+
+    auto & state = cross_op_state();
+    std::unique_lock<std::mutex> lock(state.mutex);
+    state.available.wait(lock, [&] {
+        return !state.reserved || state.owner.graph_epoch == identity.graph_epoch;
+    });
+
+    // A different context consumer in the same graph means the previous
+    // lifetime was not actually contiguous. Superseding it is safe because
+    // all commands are blocking, but it is never counted as a reuse.
+    if (state.reserved && !same_cross_op_identity(state.owner, identity)) {
+        state.reserved = false;
+        state.resident = false;
+        state.activation_sequence = 0;
+    }
+
+    if (state.reserved && same_cross_op_identity(state.owner, identity)) {
+        GGML_ASSERT(state.resident);
+        current_cross_op_request = {
+            keep_for_next ? qbs_cross_op_scope::reuse_keep : qbs_cross_op_scope::reuse_release,
+            identity,
+            state.generation,
+            state.activation_sequence,
+            qbs_activation_storage_bytes(identity.activation_profile, QBS_ACTIVATION_STORAGE_ROW_MAJOR, 1u,
+                                         static_cast<size_t>(identity.k_elements) / QBS_Q4_K_BLOCK_ELEMENTS),
+        };
+        current_activation_trace_link = {
+            identity.graph_epoch,
+            state.activation_sequence,
+            0,
+            std::numeric_limits<uintptr_t>::max(),
+        };
+        cross_op_reuse_calls.fetch_add(1, std::memory_order_relaxed);
+        cross_op_quantization_skips.fetch_add(1, std::memory_order_relaxed);
+        cross_op_activation_bytes_saved.fetch_add(current_cross_op_request.activation_bytes, std::memory_order_relaxed);
+        if (!keep_for_next) {
+            cross_op_release_calls.fetch_add(1, std::memory_order_relaxed);
+        }
+        if (ggml_riscv_qbs_trace_activation_lifetime_enabled()) {
+            std::fprintf(stderr,
+                         "GGML_RISCV_QBS_CROSS_OP graph_epoch=%llu action=%s source_id=%p "
+                         "activation_profile=%u m=%lld k=%lld generation=%u activation_seq=%llu "
+                         "quantization_skipped=1 activation_bytes_saved=%zu next_same=%d\n",
+                         static_cast<unsigned long long>(identity.graph_epoch),
+                         cross_op_scope_name(current_cross_op_request.scope),
+                         static_cast<const void *>(identity.source_tensor),
+                         identity.activation_profile, static_cast<long long>(identity.activation_rows),
+                         static_cast<long long>(identity.k_elements), state.generation,
+                         static_cast<unsigned long long>(state.activation_sequence),
+                         current_cross_op_request.activation_bytes, keep_for_next);
+        }
+        return true;
+    }
+
+    if (!keep_for_next) {
+        return false;
+    }
+
+    state.reserved = true;
+    state.resident = false;
+    state.owner = identity;
+    state.generation = allocate_context_generation(state, generation_bits);
+    state.activation_sequence = 0;
+    const size_t activation_bytes = qbs_activation_storage_bytes(
+        identity.activation_profile, QBS_ACTIVATION_STORAGE_ROW_MAJOR, 1u,
+        static_cast<size_t>(identity.k_elements) / QBS_Q4_K_BLOCK_ELEMENTS);
+    current_cross_op_request = {
+        qbs_cross_op_scope::fill_keep,
+        identity,
+        state.generation,
+        0,
+        activation_bytes,
+    };
+    cross_op_fill_calls.fetch_add(1, std::memory_order_relaxed);
+    if (ggml_riscv_qbs_trace_activation_lifetime_enabled()) {
+        std::fprintf(stderr,
+                     "GGML_RISCV_QBS_CROSS_OP graph_epoch=%llu action=fill_keep source_id=%p "
+                     "activation_profile=%u m=%lld k=%lld generation=%u activation_seq=0 "
+                     "quantization_skipped=0 activation_bytes_saved=0 next_same=1\n",
+                     static_cast<unsigned long long>(identity.graph_epoch),
+                     static_cast<const void *>(identity.source_tensor),
+                     identity.activation_profile, static_cast<long long>(identity.activation_rows),
+                     static_cast<long long>(identity.k_elements), state.generation);
+    }
+    return false;
+}
+
+extern "C" void ggml_riscv_qbs_end_graph(uint64_t graph_epoch) {
+    auto & state = cross_op_state();
+    bool notify = false;
+    {
+        std::lock_guard<std::mutex> lock(state.mutex);
+        if (state.reserved && state.owner.graph_epoch == graph_epoch) {
+            state.reserved = false;
+            state.resident = false;
+            state.activation_sequence = 0;
+            notify = true;
+        }
+    }
+    if (notify) {
+        state.available.notify_all();
+    }
+}
 
 bool ggml_riscv_qbs_supports_tensor(ggml_type type, int64_t k_elements, int64_t output_rows) {
     return tensor_support_reason(type, k_elements, output_rows) == qbs_support_reason::supported;
@@ -880,6 +1254,8 @@ void ggml_riscv_qbs_trace_activation_lifetime(const void * op_identity,
                                               ggml_type    activation_type,
                                               int64_t      activation_rows,
                                               int64_t      k_elements,
+                                              int64_t      output_rows,
+                                              uint64_t     graph_epoch,
                                               bool         quantize_time_valid,
                                               uint64_t     quantize_time_us) {
     if (!ggml_riscv_qbs_trace_activation_lifetime_enabled() || quantized_data == nullptr || quantized_bytes == 0) {
@@ -896,6 +1272,7 @@ void ggml_riscv_qbs_trace_activation_lifetime(const void * op_identity,
     std::lock_guard<std::mutex> lock(state.mutex);
 
     const uint64_t sequence = ++state.sequence;
+    state.graph_epochs.insert(graph_epoch);
     ++state.quantizations;
     state.quantized_bytes += quantized_bytes;
     if (quantize_time_valid) {
@@ -906,7 +1283,7 @@ void ggml_riscv_qbs_trace_activation_lifetime(const void * op_identity,
     const qbs_activation_trace_record * exact_match = nullptr;
     for (auto record = state.records.rbegin(); record != state.records.rend(); ++record) {
         const bool same_source = record->source_tensor_identity == source_tensor_identity;
-        if (!same_source || record->activation_type != activation_type ||
+        if (record->graph_epoch != graph_epoch || !same_source || record->activation_type != activation_type ||
             record->activation_rows != activation_rows || record->k_elements != k_elements ||
             record->quantized_data.size() != quantized_bytes || record->digest != digest) {
             continue;
@@ -914,6 +1291,23 @@ void ggml_riscv_qbs_trace_activation_lifetime(const void * op_identity,
         if (std::memcmp(record->quantized_data.data(), quantized_data, quantized_bytes) == 0) {
             exact_match = &*record;
             break;
+        }
+    }
+
+    current_activation_trace_link = {
+        graph_epoch,
+        sequence,
+        reinterpret_cast<uintptr_t>(quantized_data),
+        reinterpret_cast<uintptr_t>(quantized_data) + quantized_bytes,
+    };
+    if (current_cross_op_request.scope == qbs_cross_op_scope::fill_keep) {
+        auto & cross_state = cross_op_state();
+        std::lock_guard<std::mutex> cross_lock(cross_state.mutex);
+        if (cross_state.reserved &&
+            same_cross_op_identity(cross_state.owner, current_cross_op_request.identity) &&
+            cross_state.generation == current_cross_op_request.generation) {
+            cross_state.activation_sequence = sequence;
+            current_cross_op_request.activation_sequence = sequence;
         }
     }
 
@@ -927,15 +1321,18 @@ void ggml_riscv_qbs_trace_activation_lifetime(const void * op_identity,
     }
 
     std::fprintf(stderr,
-                 "GGML_RISCV_QBS_LIFETIME seq=%llu op=%s weight=%s "
-                 "weight_type=%s source=%s activation_type=%s rows=%lld k=%lld "
+                 "GGML_RISCV_QBS_LIFETIME seq=%llu graph_epoch=%llu op=%s weight=%s "
+                 "weight_type=%s weight_profile=%u source=%s activation_type=%s activation_profile=%u "
+                 "m=%lld n=%lld k=%lld "
                  "bytes=%zu digest=%016llx match_seq=%llu match_weight=%s "
                  "same_tensor=%d same_data=%d reusable=%d quantize_time_valid=%d "
                  "quantize_time_us=%llu op_id=%p weight_id=%p source_id=%p source_data=%p quantized_data=%p\n",
-                 static_cast<unsigned long long>(sequence), trace_name(op_name).c_str(),
-                 trace_name(weight_name).c_str(), ggml_type_name(weight_type), trace_name(source_name).c_str(),
-                 ggml_type_name(activation_type), static_cast<long long>(activation_rows),
-                 static_cast<long long>(k_elements), quantized_bytes, static_cast<unsigned long long>(digest),
+                 static_cast<unsigned long long>(sequence), static_cast<unsigned long long>(graph_epoch),
+                 trace_name(op_name).c_str(), trace_name(weight_name).c_str(), ggml_type_name(weight_type),
+                 profile_for_type(weight_type).weight, trace_name(source_name).c_str(), ggml_type_name(activation_type),
+                 profile_for_type(weight_type).activation, static_cast<long long>(activation_rows),
+                 static_cast<long long>(output_rows), static_cast<long long>(k_elements), quantized_bytes,
+                 static_cast<unsigned long long>(digest),
                  static_cast<unsigned long long>(exact_match ? exact_match->sequence : 0),
                  exact_match ? exact_match->weight_name.c_str() : "-",
                  exact_match && exact_match->source_tensor_identity == source_tensor_identity,
@@ -949,11 +1346,13 @@ void ggml_riscv_qbs_trace_activation_lifetime(const void * op_identity,
 
     qbs_activation_trace_record record = {
         sequence,
+        graph_epoch,
         source_tensor_identity,
         source_data,
         activation_type,
         activation_rows,
         k_elements,
+        output_rows,
         digest,
         trace_name(weight_name),
         std::vector<uint8_t>(static_cast<const uint8_t *>(quantized_data),
@@ -1009,7 +1408,10 @@ void ggml_riscv_qbs_gemv(ggml_type    weight_type,
     GGML_ASSERT(plan_status == QBS_STATUS_OK);
     record_operation(weight_type, false, n, input_rows, output_rows, plan.split_k);
     qbs_workspace_buffer  workspace(plan.workspace_bytes);
-    qbs_execution_context context{ weight_type, qbs_emulation_enabled() };
+    const qbs_activation_trace_link trace_link = linked_activation(activations);
+    qbs_execution_context context{
+        weight_type, qbs_emulation_enabled(), trace_link.graph_epoch, trace_link.activation_sequence
+    };
     const size_t          weight_bytes = qbs_weight_storage_bytes(profile.weight, QBS_WEIGHT_LAYOUT_R4_BLOCK_MAJOR,
                                                                   static_cast<size_t>(output_rows), plan.k_blocks);
     const size_t activation_bytes = qbs_activation_storage_bytes(profile.activation, QBS_ACTIVATION_STORAGE_ROW_MAJOR,
@@ -1046,7 +1448,10 @@ void ggml_riscv_qbs_gemm(ggml_type    weight_type,
     GGML_ASSERT(plan_status == QBS_STATUS_OK);
     record_operation(weight_type, true, n, input_rows, output_rows, plan.split_k);
     qbs_workspace_buffer  workspace(plan.workspace_bytes);
-    qbs_execution_context context{ weight_type, qbs_emulation_enabled() };
+    const qbs_activation_trace_link trace_link = linked_activation(activations);
+    qbs_execution_context context{
+        weight_type, qbs_emulation_enabled(), trace_link.graph_epoch, trace_link.activation_sequence
+    };
     const size_t          weight_bytes = qbs_weight_storage_bytes(profile.weight, QBS_WEIGHT_LAYOUT_R4_BLOCK_MAJOR,
                                                                   static_cast<size_t>(output_rows), plan.k_blocks);
     const size_t activation_bytes = qbs_activation_storage_bytes(profile.activation, QBS_ACTIVATION_STORAGE_M4_GROUPED,

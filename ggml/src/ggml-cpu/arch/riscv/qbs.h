@@ -5,6 +5,8 @@
 #include <cstddef>
 #include <cstdint>
 
+struct ggml_compute_params;
+
 // Marker types keep the QBS layouts distinct from the standard RVV repacks.
 struct ggml_riscv_qbs_q4_k_tag {};
 
@@ -37,6 +39,14 @@ void ggml_riscv_qbs_trace_tensor_decision(const void * tensor_identity,
 
 bool ggml_riscv_qbs_trace_activation_lifetime_enabled();
 
+// Returns true only when this invocation can consume an already resident,
+// semantically identical activation and may therefore skip quantization.
+bool ggml_riscv_qbs_prepare_activation_context(const ggml_compute_params * params,
+                                               const ggml_tensor *         op,
+                                               ggml_type                   activation_type,
+                                               int64_t                     activation_rows,
+                                               int64_t                     k_elements);
+
 void ggml_riscv_qbs_trace_activation_lifetime(const void * op_identity,
                                               const char * op_name,
                                               const void * weight_identity,
@@ -50,6 +60,8 @@ void ggml_riscv_qbs_trace_activation_lifetime(const void * op_identity,
                                               ggml_type    activation_type,
                                               int64_t      activation_rows,
                                               int64_t      k_elements,
+                                              int64_t      output_rows,
+                                              uint64_t     graph_epoch,
                                               bool         quantize_time_valid,
                                               uint64_t     quantize_time_us);
 
@@ -78,3 +90,5 @@ void ggml_riscv_qbs_gemm(ggml_type    weight_type,
                          const void * activations,
                          int          input_rows,
                          int          output_rows);
+
+extern "C" void ggml_riscv_qbs_end_graph(uint64_t graph_epoch);
