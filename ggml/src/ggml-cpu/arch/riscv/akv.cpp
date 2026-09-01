@@ -206,7 +206,9 @@ static support_reason supports(const ggml_compute_params * params,
         dst->type != GGML_TYPE_F32) {
         return support_reason::shape;
     }
-    if ((q->ne[0] != AKV_HEAD_DIM_64 && q->ne[0] != AKV_HEAD_DIM_128) || q->ne[1] != 1 || q->ne[2] <= 0 ||
+    if ((q->ne[0] != AKV_HEAD_DIM_64 && q->ne[0] != AKV_HEAD_DIM_96 &&
+         q->ne[0] != AKV_HEAD_DIM_128) ||
+        q->ne[1] != 1 || q->ne[2] <= 0 ||
         q->ne[3] != 1 || k->ne[0] != q->ne[0] || v->ne[0] != q->ne[0] || k->ne[1] <= 0 ||
         k->ne[1] != v->ne[1] || k->ne[2] <= 0 || k->ne[2] != v->ne[2] || k->ne[3] != 1 || v->ne[3] != 1 ||
         q->ne[2] % k->ne[2] != 0 || dst->ne[0] != q->ne[0] || dst->ne[1] != q->ne[2] || dst->ne[2] != 1 ||
@@ -226,7 +228,12 @@ static support_reason supports(const ggml_compute_params * params,
     } else if (!akv_attention_v2_shape_supported(*q_rows, *head_dim)) {
         return support_reason::shape;
     }
-    const bool head_dim_capable = *head_dim == AKV_HEAD_DIM_64 ? caps.head_dim_64 : caps.head_dim_128;
+    const bool head_dim_capable =
+        *head_dim == AKV_HEAD_DIM_64
+            ? caps.head_dim_64
+            : (*head_dim == AKV_HEAD_DIM_96
+                   ? caps.token_axis_d_axis_tail
+                   : caps.head_dim_128);
     if (!head_dim_capable || caps.max_q_rows < *q_rows) {
         return support_reason::capability;
     }
