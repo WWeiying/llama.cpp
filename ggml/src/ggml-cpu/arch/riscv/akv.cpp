@@ -11,6 +11,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <limits>
 
 namespace {
 
@@ -51,6 +52,7 @@ enum class kernel_policy {
 };
 
 static trace_counters trace;
+static std::atomic<bool> prefill_layout_reported{};
 
 static bool env_true(const char * name) {
     const char * value = std::getenv(name);
@@ -328,6 +330,68 @@ static int prefill_past_tokens(const ggml_tensor * mask,
     return past <= UINT16_MAX ? static_cast<int>(past) : -1;
 }
 
+static void report_prefill_layout_once(const ggml_tensor * dst) {
+    bool expected = false;
+    if (!prefill_layout_reported.compare_exchange_strong(expected, true)) {
+        return;
+    }
+
+    const ggml_tensor * q    = dst->src[0];
+    const ggml_tensor * k    = dst->src[1];
+    const ggml_tensor * v    = dst->src[2];
+    const ggml_tensor * mask = dst->src[3];
+    std::fprintf(stderr,
+                 "GGML_RISCV_AKV_PREFILL_LAYOUT q_cont=%d k_cont=%d v_cont=%d mask_cont=%d dst_cont=%d "
+                 "q_mod32=%zu k_mod32=%zu v_mod32=%zu mask_mod32=%zu dst_mod32=%zu "
+                 "q_nb=%zu,%zu,%zu,%zu k_nb=%zu,%zu,%zu,%zu v_nb=%zu,%zu,%zu,%zu "
+                 "mask_nb=%zu,%zu,%zu,%zu dst_nb=%zu,%zu,%zu,%zu\n",
+                 ggml_is_contiguous(q), ggml_is_contiguous(k), ggml_is_contiguous(v),
+                 ggml_is_contiguous(mask), ggml_is_contiguous(dst),
+                 reinterpret_cast<uintptr_t>(q->data) & 31u,
+                 reinterpret_cast<uintptr_t>(k->data) & 31u,
+                 reinterpret_cast<uintptr_t>(v->data) & 31u,
+                 reinterpret_cast<uintptr_t>(mask->data) & 31u,
+                 reinterpret_cast<uintptr_t>(dst->data) & 31u,
+                 q->nb[0], q->nb[1], q->nb[2], q->nb[3],
+                 k->nb[0], k->nb[1], k->nb[2], k->nb[3],
+                 v->nb[0], v->nb[1], v->nb[2], v->nb[3],
+                 mask->nb[0], mask->nb[1], mask->nb[2], mask->nb[3],
+                 dst->nb[0], dst->nb[1], dst->nb[2], dst->nb[3]);
+}
+
+static bool regular_matrix_rows(size_t row_bytes,
+                                int64_t first_count, size_t first_stride,
+                                int64_t second_count, size_t second_stride) {
+    if (row_bytes == 0 || first_count <= 0 || second_count <= 0) {
+        return false;
+    }
+    const size_t maximum = std::numeric_limits<size_t>::max();
+    const size_t first_rows = static_cast<size_t>(first_count - 1);
+    const size_t second_rows = static_cast<size_t>(second_count - 1);
+    if ((first_rows != 0 && first_stride > maximum / first_rows) ||
+        (second_rows != 0 && second_stride > maximum / second_rows)) {
+        return false;
+    }
+    const size_t first_offset  = first_rows * first_stride;
+    const size_t second_offset = second_rows * second_stride;
+    if (first_offset > maximum - second_offset || first_offset + second_offset > maximum - row_bytes) {
+        return false;
+    }
+    const size_t first_extent  = first_offset + row_bytes;
+    const size_t second_extent = second_offset + row_bytes;
+    return (first_stride >= row_bytes && second_stride >= first_extent) ||
+           (second_stride >= row_bytes && first_stride >= second_extent);
+}
+
+static bool regular_linear_rows(size_t row_bytes, int64_t count, size_t stride) {
+    if (row_bytes == 0 || count <= 0 || (count > 1 && stride < row_bytes)) {
+        return false;
+    }
+    const size_t maximum = std::numeric_limits<size_t>::max();
+    const size_t rows = static_cast<size_t>(count - 1);
+    return rows == 0 || (stride <= maximum / rows && rows * stride <= maximum - row_bytes);
+}
+
 static support_reason supports_prefill(const ggml_compute_params * params,
                                        const ggml_tensor *        dst,
                                        int *                      past_tokens,
@@ -401,16 +465,27 @@ static support_reason supports_prefill(const ggml_compute_params * params,
     if (mask->ne[0] != k->ne[1] || mask->ne[1] != q->ne[1] || mask->ne[2] != 1 || mask->ne[3] != 1) {
         return support_reason::mask;
     }
+    const size_t query_row_bytes = static_cast<size_t>(*head_dim) * sizeof(float);
+    const size_t kv_row_bytes = static_cast<size_t>(*head_dim) * sizeof(ggml_fp16_t);
+    const size_t mask_row_bytes = static_cast<size_t>(k->ne[1]) * sizeof(ggml_fp16_t);
     if (q->data == nullptr || k->data == nullptr || v->data == nullptr || mask->data == nullptr ||
-        dst->data == nullptr || !ggml_is_contiguous(q) || !ggml_is_contiguous(k) || !ggml_is_contiguous(v) ||
-        !ggml_is_contiguous(mask) || !ggml_is_contiguous(dst) || q->nb[0] != sizeof(float) ||
-        k->nb[0] != sizeof(ggml_fp16_t) || v->nb[0] != sizeof(ggml_fp16_t) ||
-        mask->nb[0] != sizeof(ggml_fp16_t) || dst->nb[0] != sizeof(float) ||
-        (reinterpret_cast<uintptr_t>(q->data) | reinterpret_cast<uintptr_t>(dst->data)) % alignof(float) != 0 ||
-        (reinterpret_cast<uintptr_t>(k->data) | reinterpret_cast<uintptr_t>(v->data)) %
-                (UINT64_C(1) << AKV_V2_PAYLOAD_ALIGNMENT_LOG2) !=
-            0 ||
-        reinterpret_cast<uintptr_t>(mask->data) % alignof(ggml_fp16_t) != 0) {
+        dst->data == nullptr || q->nb[0] != sizeof(float) || k->nb[0] != sizeof(ggml_fp16_t) ||
+        v->nb[0] != sizeof(ggml_fp16_t) || mask->nb[0] != sizeof(ggml_fp16_t) ||
+        dst->nb[0] != sizeof(float) || q->nb[1] > UINT32_MAX || q->nb[2] > UINT32_MAX ||
+        k->nb[1] > UINT32_MAX || k->nb[2] > UINT32_MAX || v->nb[1] > UINT32_MAX ||
+        v->nb[2] > UINT32_MAX || mask->nb[1] > UINT32_MAX || dst->nb[2] > UINT32_MAX ||
+        !regular_matrix_rows(query_row_bytes, q->ne[1], q->nb[1], q->ne[2], q->nb[2]) ||
+        !regular_matrix_rows(kv_row_bytes, k->ne[1], k->nb[1], k->ne[2], k->nb[2]) ||
+        !regular_matrix_rows(kv_row_bytes, v->ne[1], v->nb[1], v->ne[2], v->nb[2]) ||
+        !regular_linear_rows(mask_row_bytes, mask->ne[1], mask->nb[1]) ||
+        dst->nb[1] != query_row_bytes ||
+        !regular_matrix_rows(query_row_bytes, dst->ne[1], dst->nb[1], dst->ne[2], dst->nb[2]) ||
+        (reinterpret_cast<uintptr_t>(q->data) | reinterpret_cast<uintptr_t>(dst->data) |
+         q->nb[1] | q->nb[2] | dst->nb[2]) % alignof(float) != 0 ||
+        (reinterpret_cast<uintptr_t>(k->data) | reinterpret_cast<uintptr_t>(v->data) |
+         k->nb[1] | k->nb[2] | v->nb[1] | v->nb[2]) %
+                (UINT64_C(1) << AKV_V2_PAYLOAD_ALIGNMENT_LOG2) != 0 ||
+        (reinterpret_cast<uintptr_t>(mask->data) | mask->nb[1]) % alignof(ggml_fp16_t) != 0) {
         return support_reason::layout;
     }
 
@@ -497,6 +572,9 @@ bool ggml_riscv_akv_flash_attn(const ggml_compute_params * params, ggml_tensor *
     if (reason != support_reason::supported) {
         if (trace_enabled && params->ith == 0) {
             trace.fallback[fallback_index(reason)].fetch_add(1, std::memory_order_relaxed);
+            if (is_prefill && reason == support_reason::layout) {
+                report_prefill_layout_once(dst);
+            }
         }
         return false;
     }
@@ -528,6 +606,14 @@ bool ggml_riscv_akv_flash_attn(const ggml_compute_params * params, ggml_tensor *
             static_cast<uint32_t>(k->ne[1]),
             head_dim,
             scale,
+            static_cast<uint32_t>(q->nb[1]),
+            static_cast<uint32_t>(q->nb[2]),
+            static_cast<uint32_t>(k->nb[1]),
+            static_cast<uint32_t>(k->nb[2]),
+            static_cast<uint32_t>(v->nb[1]),
+            static_cast<uint32_t>(v->nb[2]),
+            static_cast<uint32_t>(mask->nb[1]),
+            static_cast<uint32_t>(dst->nb[2]),
         };
         const akv_status_t execute_status =
             emulation_enabled() ? akv_attention_execute_v2_prefill_reference(&device(), &problem, &workspace)
