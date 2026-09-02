@@ -23,6 +23,7 @@ enum class support_reason {
     shape,
     layout,
     mask,
+    size,
 };
 
 struct trace_counters {
@@ -35,7 +36,11 @@ struct trace_counters {
     std::atomic<uint64_t>                groups_v2{};
     std::atomic<uint64_t>                kv_group_tokens{};
     std::atomic<uint64_t>                attention_macs{};
-    std::array<std::atomic<uint64_t>, 7> fallback{};
+    std::atomic<uint64_t>                executed_decode{};
+    std::atomic<uint64_t>                executed_prefill{};
+    std::atomic<uint64_t>                prefill_query_tokens{};
+    std::atomic<uint64_t>                prefill_attention_pairs{};
+    std::array<std::atomic<uint64_t>, 8> fallback{};
 };
 
 enum class kernel_policy {
@@ -86,9 +91,11 @@ static void report_trace() {
     std::fprintf(stderr,
                  "GGML_RISCV_AKV_COVERAGE candidate_ops=%llu executed_ops=%llu groups=%llu "
                  "executed_v1=%llu executed_v2=%llu groups_v1=%llu groups_v2=%llu "
-                 "kv_group_tokens=%llu attention_macs=%llu "
+                 "kv_group_tokens=%llu attention_macs=%llu executed_decode=%llu executed_prefill=%llu "
+                 "prefill_query_tokens=%llu prefill_attention_pairs=%llu "
                  "fallback_runtime=%llu fallback_capability=%llu fallback_threading=%llu "
-                 "fallback_feature=%llu fallback_shape=%llu fallback_layout=%llu fallback_mask=%llu\n",
+                 "fallback_feature=%llu fallback_shape=%llu fallback_layout=%llu fallback_mask=%llu "
+                 "fallback_size=%llu\n",
                  static_cast<unsigned long long>(trace.candidates.load()),
                  static_cast<unsigned long long>(trace.executed.load()),
                  static_cast<unsigned long long>(trace.groups.load()),
@@ -98,13 +105,18 @@ static void report_trace() {
                  static_cast<unsigned long long>(trace.groups_v2.load()),
                  static_cast<unsigned long long>(trace.kv_group_tokens.load()),
                  static_cast<unsigned long long>(trace.attention_macs.load()),
+                 static_cast<unsigned long long>(trace.executed_decode.load()),
+                 static_cast<unsigned long long>(trace.executed_prefill.load()),
+                 static_cast<unsigned long long>(trace.prefill_query_tokens.load()),
+                 static_cast<unsigned long long>(trace.prefill_attention_pairs.load()),
                  static_cast<unsigned long long>(trace.fallback[0].load()),
                  static_cast<unsigned long long>(trace.fallback[1].load()),
                  static_cast<unsigned long long>(trace.fallback[2].load()),
                  static_cast<unsigned long long>(trace.fallback[3].load()),
                  static_cast<unsigned long long>(trace.fallback[4].load()),
                  static_cast<unsigned long long>(trace.fallback[5].load()),
-                 static_cast<unsigned long long>(trace.fallback[6].load()));
+                 static_cast<unsigned long long>(trace.fallback[6].load()),
+                 static_cast<unsigned long long>(trace.fallback[7].load()));
 }
 
 static void register_trace() {
@@ -148,12 +160,12 @@ static int active_prefix(const ggml_tensor * mask, int64_t kv_length) {
     return active > 0 && active <= UINT16_MAX ? static_cast<int>(active) : -1;
 }
 
-static support_reason supports(const ggml_compute_params * params,
-                               const ggml_tensor *        dst,
-                               int *                      active_kv,
-                               uint32_t *                 kernel_version,
-                               uint32_t *                 q_rows,
-                               uint32_t *                 head_dim) {
+static support_reason supports_decode(const ggml_compute_params * params,
+                                      const ggml_tensor *        dst,
+                                      int *                      active_kv,
+                                      uint32_t *                 kernel_version,
+                                      uint32_t *                 q_rows,
+                                      uint32_t *                 head_dim) {
     const ggml_tensor * q     = dst->src[0];
     const ggml_tensor * k     = dst->src[1];
     const ggml_tensor * v     = dst->src[2];
@@ -270,6 +282,142 @@ static support_reason supports(const ggml_compute_params * params,
     return *active_kv > 0 ? support_reason::supported : support_reason::mask;
 }
 
+static int prefill_past_tokens(const ggml_tensor * mask,
+                               int64_t             query_tokens,
+                               int64_t             kv_capacity,
+                               uint64_t *          attention_pairs) {
+    const auto * values = static_cast<const ggml_fp16_t *>(mask->data);
+    int64_t      first_prefix = 0;
+    while (first_prefix < kv_capacity && values[first_prefix] != UINT16_C(0xfc00)) {
+        if ((values[first_prefix] & UINT16_C(0x7c00)) == UINT16_C(0x7c00)) {
+            return -1;
+        }
+        ++first_prefix;
+    }
+    if (first_prefix <= 0) {
+        return -1;
+    }
+    for (int64_t sequence = first_prefix; sequence < kv_capacity; ++sequence) {
+        if (values[sequence] != UINT16_C(0xfc00)) {
+            return -1;
+        }
+    }
+
+    const int64_t past = first_prefix - 1;
+    uint64_t      pairs = 0;
+    for (int64_t token = 0; token < query_tokens; ++token) {
+        const int64_t expected_prefix = past + token + 1;
+        if (expected_prefix <= 0 || expected_prefix > kv_capacity) {
+            return -1;
+        }
+        const auto * row = reinterpret_cast<const ggml_fp16_t *>(
+            static_cast<const char *>(mask->data) + token * mask->nb[1]);
+        for (int64_t sequence = 0; sequence < expected_prefix; ++sequence) {
+            if ((row[sequence] & UINT16_C(0x7c00)) == UINT16_C(0x7c00)) {
+                return -1;
+            }
+        }
+        for (int64_t sequence = expected_prefix; sequence < kv_capacity; ++sequence) {
+            if (row[sequence] != UINT16_C(0xfc00)) {
+                return -1;
+            }
+        }
+        pairs += static_cast<uint64_t>(expected_prefix);
+    }
+    *attention_pairs = pairs;
+    return past <= UINT16_MAX ? static_cast<int>(past) : -1;
+}
+
+static support_reason supports_prefill(const ggml_compute_params * params,
+                                       const ggml_tensor *        dst,
+                                       int *                      past_tokens,
+                                       uint64_t *                 attention_pairs,
+                                       uint32_t *                 q_rows,
+                                       uint32_t *                 head_dim) {
+    constexpr int64_t min_query_tokens = 15;
+    const ggml_tensor * q     = dst->src[0];
+    const ggml_tensor * k     = dst->src[1];
+    const ggml_tensor * v     = dst->src[2];
+    const ggml_tensor * mask  = dst->src[3];
+    const ggml_tensor * sinks = dst->src[4];
+
+    if (!runtime_enabled()) {
+        return support_reason::runtime_disabled;
+    }
+    const akv_capabilities_t & caps = device().capabilities;
+    if (!caps.valid || !caps.enabled || !caps.f16_payload || !caps.token_axis_valid ||
+        !caps.token_axis_enabled || !caps.token_axis_tail || !caps.token_axis_row_view ||
+        caps.context_count == 0 || caps.token_axis_tile_tokens != AKV_V2_TILE_TOKENS) {
+        return support_reason::capability;
+    }
+    const kernel_policy policy = requested_kernel_policy();
+    if (policy == kernel_policy::v1 || policy == kernel_policy::invalid) {
+        return support_reason::feature;
+    }
+    if (params->nth <= 0 || params->ith < 0 || params->ith >= params->nth) {
+        return support_reason::threading;
+    }
+
+    float max_bias      = 0.0f;
+    float logit_softcap = 0.0f;
+    float scale         = 1.0f;
+    std::memcpy(&scale, reinterpret_cast<const float *>(dst->op_params), sizeof(float));
+    std::memcpy(&max_bias, reinterpret_cast<const float *>(dst->op_params) + 1, sizeof(float));
+    std::memcpy(&logit_softcap, reinterpret_cast<const float *>(dst->op_params) + 2, sizeof(float));
+    if (params->use_ref || sinks != nullptr || !std::isfinite(scale) || scale <= 0.0f || max_bias != 0.0f ||
+        logit_softcap != 0.0f) {
+        return support_reason::feature;
+    }
+    if (q == nullptr || k == nullptr || v == nullptr || mask == nullptr || q->type != GGML_TYPE_F32 ||
+        k->type != GGML_TYPE_F16 || v->type != GGML_TYPE_F16 || mask->type != GGML_TYPE_F16 ||
+        dst->type != GGML_TYPE_F32) {
+        return support_reason::shape;
+    }
+    if (q->ne[1] < min_query_tokens) {
+        return support_reason::size;
+    }
+    if ((q->ne[0] != AKV_HEAD_DIM_64 && q->ne[0] != AKV_HEAD_DIM_96 && q->ne[0] != AKV_HEAD_DIM_128) ||
+        q->ne[1] > UINT16_MAX || q->ne[2] <= 0 || q->ne[2] > UINT32_MAX || q->ne[3] != 1 ||
+        k->ne[0] != q->ne[0] ||
+        v->ne[0] != q->ne[0] || k->ne[1] <= 0 || k->ne[1] > UINT16_MAX || k->ne[1] != v->ne[1] ||
+        k->ne[2] <= 0 || k->ne[2] > UINT32_MAX || k->ne[2] != v->ne[2] || k->ne[3] != 1 || v->ne[3] != 1 ||
+        q->ne[2] % k->ne[2] != 0 || dst->ne[0] != q->ne[0] || dst->ne[1] != q->ne[2] ||
+        dst->ne[2] != q->ne[1] || dst->ne[3] != 1) {
+        return support_reason::shape;
+    }
+    const int64_t shape_q_rows = q->ne[2] / k->ne[2];
+    if (shape_q_rows <= 0 || shape_q_rows > AKV_MAX_Q_ROWS || shape_q_rows > caps.max_q_rows) {
+        return support_reason::shape;
+    }
+    *q_rows  = static_cast<uint32_t>(shape_q_rows);
+    *head_dim = static_cast<uint32_t>(q->ne[0]);
+    const bool head_dim_capable =
+        *head_dim == AKV_HEAD_DIM_64
+            ? caps.head_dim_64
+            : (*head_dim == AKV_HEAD_DIM_96 ? caps.token_axis_d_axis_tail : caps.head_dim_128);
+    if (!head_dim_capable) {
+        return support_reason::capability;
+    }
+    if (mask->ne[0] != k->ne[1] || mask->ne[1] != q->ne[1] || mask->ne[2] != 1 || mask->ne[3] != 1) {
+        return support_reason::mask;
+    }
+    if (q->data == nullptr || k->data == nullptr || v->data == nullptr || mask->data == nullptr ||
+        dst->data == nullptr || !ggml_is_contiguous(q) || !ggml_is_contiguous(k) || !ggml_is_contiguous(v) ||
+        !ggml_is_contiguous(mask) || !ggml_is_contiguous(dst) || q->nb[0] != sizeof(float) ||
+        k->nb[0] != sizeof(ggml_fp16_t) || v->nb[0] != sizeof(ggml_fp16_t) ||
+        mask->nb[0] != sizeof(ggml_fp16_t) || dst->nb[0] != sizeof(float) ||
+        (reinterpret_cast<uintptr_t>(q->data) | reinterpret_cast<uintptr_t>(dst->data)) % alignof(float) != 0 ||
+        (reinterpret_cast<uintptr_t>(k->data) | reinterpret_cast<uintptr_t>(v->data)) %
+                (UINT64_C(1) << AKV_V2_PAYLOAD_ALIGNMENT_LOG2) !=
+            0 ||
+        reinterpret_cast<uintptr_t>(mask->data) % alignof(ggml_fp16_t) != 0) {
+        return support_reason::layout;
+    }
+
+    *past_tokens = prefill_past_tokens(mask, q->ne[1], k->ne[1], attention_pairs);
+    return *past_tokens >= 0 ? support_reason::supported : support_reason::mask;
+}
+
 static akv_status_t emulate(void *,
                             const akv_descriptor_t * descriptor,
                             const uint16_t *         mask,
@@ -335,11 +483,17 @@ bool ggml_riscv_akv_flash_attn(const ggml_compute_params * params, ggml_tensor *
         trace.candidates.fetch_add(1, std::memory_order_relaxed);
     }
 
-    int                  active_kv      = 0;
+    const ggml_tensor *  candidate_q     = dst->src[0];
+    const bool           is_prefill      = candidate_q != nullptr && candidate_q->ne[1] > 1;
+    int                  active_kv       = 0;
+    int                  past_tokens     = 0;
+    uint64_t             attention_pairs = 0;
     uint32_t             kernel_version = 0;
     uint32_t             q_rows         = 0;
     uint32_t             head_dim       = 0;
-    const support_reason reason = supports(params, dst, &active_kv, &kernel_version, &q_rows, &head_dim);
+    const support_reason reason =
+        is_prefill ? supports_prefill(params, dst, &past_tokens, &attention_pairs, &q_rows, &head_dim)
+                   : supports_decode(params, dst, &active_kv, &kernel_version, &q_rows, &head_dim);
     if (reason != support_reason::supported) {
         if (trace_enabled && params->ith == 0) {
             trace.fallback[fallback_index(reason)].fetch_add(1, std::memory_order_relaxed);
@@ -359,6 +513,64 @@ bool ggml_riscv_akv_flash_attn(const ggml_compute_params * params, ggml_tensor *
     const ggml_tensor * mask  = dst->src[3];
     float               scale = 1.0f;
     std::memcpy(&scale, dst->op_params, sizeof(float));
+
+    if (is_prefill) {
+        alignas(AKV_DESCRIPTOR_BYTES) akv_attention_v2_prefill_workspace_t workspace{};
+        const akv_attention_v2_prefill_problem_t problem = {
+            static_cast<const float *>(q->data),
+            reinterpret_cast<const uint16_t *>(k->data),
+            reinterpret_cast<const uint16_t *>(v->data),
+            reinterpret_cast<const uint16_t *>(mask->data),
+            static_cast<float *>(dst->data),
+            static_cast<uint32_t>(q->ne[1]),
+            static_cast<uint32_t>(q->ne[2]),
+            static_cast<uint32_t>(k->ne[2]),
+            static_cast<uint32_t>(k->ne[1]),
+            head_dim,
+            scale,
+        };
+        const akv_status_t execute_status =
+            emulation_enabled() ? akv_attention_execute_v2_prefill_reference(&device(), &problem, &workspace)
+                                : akv_attention_execute_v2_prefill_native(&device(), &problem, &workspace);
+        if (execute_status != AKV_STATUS_OK) {
+            GGML_ABORT("AKV Prefill execution failed after preflight: %s", akv_status_string(execute_status));
+        }
+
+        if (trace_enabled) {
+            uint64_t groups          = 0;
+            uint64_t kv_group_tokens = 0;
+            for (int64_t token_start = 0; token_start < q->ne[1]; token_start += AKV_PREFILL_QUERY_BLOCK_TOKENS) {
+                const int64_t token_end =
+                    std::min<int64_t>(token_start + AKV_PREFILL_QUERY_BLOCK_TOKENS, q->ne[1]);
+                groups += static_cast<uint64_t>(k->ne[2]);
+                kv_group_tokens +=
+                    static_cast<uint64_t>(k->ne[2]) * static_cast<uint64_t>(past_tokens + token_end);
+            }
+            const uint64_t all_head_pairs = attention_pairs * static_cast<uint64_t>(q->ne[2]);
+            const uint64_t attention_macs = UINT64_C(2) * all_head_pairs * head_dim;
+            trace.executed.fetch_add(1, std::memory_order_relaxed);
+            trace.executed_v2.fetch_add(1, std::memory_order_relaxed);
+            trace.executed_prefill.fetch_add(1, std::memory_order_relaxed);
+            trace.groups.fetch_add(groups, std::memory_order_relaxed);
+            trace.groups_v2.fetch_add(groups, std::memory_order_relaxed);
+            trace.kv_group_tokens.fetch_add(kv_group_tokens, std::memory_order_relaxed);
+            trace.attention_macs.fetch_add(attention_macs, std::memory_order_relaxed);
+            trace.prefill_query_tokens.fetch_add(static_cast<uint64_t>(q->ne[1]), std::memory_order_relaxed);
+            trace.prefill_attention_pairs.fetch_add(all_head_pairs, std::memory_order_relaxed);
+            std::fprintf(stderr,
+                         "GGML_RISCV_AKV_EXEC mode=prefill kernel=v2 M=%llu P=%d kv_capacity=%llu "
+                         "kv_heads=%llu q_heads=%llu q_rows=%u head_dim=%u groups=%llu attention_pairs=%llu "
+                         "attention_macs=%llu\n",
+                         static_cast<unsigned long long>(q->ne[1]), past_tokens,
+                         static_cast<unsigned long long>(k->ne[1]),
+                         static_cast<unsigned long long>(k->ne[2]),
+                         static_cast<unsigned long long>(q->ne[2]), q_rows, head_dim,
+                         static_cast<unsigned long long>(groups),
+                         static_cast<unsigned long long>(all_head_pairs),
+                         static_cast<unsigned long long>(attention_macs));
+        }
+        return true;
+    }
 
     alignas(64) std::array<ggml_fp16_t, AKV_MAX_Q_ROWS * AKV_HEAD_DIM_128> query{};
     alignas(AKV_DESCRIPTOR_BYTES) akv_attention_plan_t                                  plan{};
@@ -406,6 +618,7 @@ bool ggml_riscv_akv_flash_attn(const ggml_compute_params * params, ggml_tensor *
         const uint64_t kv_group_tokens = groups * static_cast<uint64_t>(active_kv);
         const uint64_t attention_macs = UINT64_C(2) * kv_group_tokens * q_rows * head_dim;
         trace.executed.fetch_add(1, std::memory_order_relaxed);
+        trace.executed_decode.fetch_add(1, std::memory_order_relaxed);
         trace.groups.fetch_add(groups, std::memory_order_relaxed);
         trace.kv_group_tokens.fetch_add(kv_group_tokens, std::memory_order_relaxed);
         trace.attention_macs.fetch_add(attention_macs, std::memory_order_relaxed);
@@ -417,7 +630,7 @@ bool ggml_riscv_akv_flash_attn(const ggml_compute_params * params, ggml_tensor *
             trace.groups_v1.fetch_add(groups, std::memory_order_relaxed);
         }
         std::fprintf(stderr,
-                     "GGML_RISCV_AKV_EXEC kernel=v%u kv_heads=%llu q_rows=%llu gqa_rows=%u head_dim=%u "
+                     "GGML_RISCV_AKV_EXEC mode=decode kernel=v%u kv_heads=%llu q_rows=%llu gqa_rows=%u head_dim=%u "
                      "active_kv=%d attention_macs=%llu\n",
                      kernel_version,
                      static_cast<unsigned long long>(groups),
