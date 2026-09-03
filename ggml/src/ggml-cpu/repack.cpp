@@ -4579,6 +4579,18 @@ template <typename BLOC_TYPE, int64_t INTER_SIZE, int64_t NB_COLS, ggml_type PAR
             case GGML_OP_MUL_MAT:
                 {
                     size = ggml_row_size(PARAM_TYPE, ggml_nelements(op->src[1]));
+#if defined(GGML_USE_RISCV_QBS)
+                    if constexpr (is_qbs_block_type<BLOC_TYPE>::value) {
+                        ggml_riscv_qbs_activation_plan activation_plan{};
+                        if (op->src[1]->ne[2] == 1 && op->src[1]->ne[3] == 1 &&
+                            ggml_riscv_qbs_plan_activations(op->src[0]->type, op->src[1]->ne[1],
+                                                           op->src[0]->ne[1], op->src[1]->ne[0],
+                                                           &activation_plan) &&
+                            activation_plan.wide_m) {
+                            size = activation_plan.workspace_bytes;
+                        }
+                    }
+#endif
                     return true;
                 }
             case GGML_OP_MUL_MAT_ID:
@@ -4652,6 +4664,22 @@ template <typename BLOC_TYPE, int64_t INTER_SIZE, int64_t NB_COLS, ggml_type PAR
         const int64_t ncols = src0_end - src0_start;
 
         GGML_ASSERT(src1_ptr + src1_col_stride * nrows <= (const char *) params->wdata + params->wsize);
+
+#if defined(GGML_USE_RISCV_QBS)
+        if constexpr (is_qbs_block_type<BLOC_TYPE>::value) {
+            ggml_riscv_qbs_activation_plan activation_plan{};
+            const bool wide_m = ne12 == 1 && ne13 == 1 && src1_start == 0 && nrows == ne11 &&
+                                ggml_riscv_qbs_plan_activations(
+                                    src0->type, ne11, ne01, ne10, &activation_plan) && activation_plan.wide_m;
+            if (wide_m) {
+                GGML_ASSERT(activation_plan.packed_bytes <= params->wsize);
+                ggml_riscv_qbs_gemm_wide(
+                    src0->type, ne00, (float *) dst_ptr + src0_start, nb1 / nb0,
+                    src0_ptr + src0_start * nb01, src1_ptr, static_cast<int>(nrows), static_cast<int>(ncols));
+                return;
+            }
+        }
+#endif
 
         // If there are more than three rows in src1, use gemm; otherwise, use gemv.
         if (nrows > 3) {
@@ -4733,13 +4761,36 @@ template <typename BLOC_TYPE, int64_t INTER_SIZE, int64_t NB_COLS, ggml_type PAR
         const bool quantize_time_valid = trace_qbs_lifetime && !reuse_qbs_activation && nth == 1 && ith == 0;
         const uint64_t quantize_time_start_us = quantize_time_valid ? ggml_time_us() : 0;
         uint64_t quantize_time_us = 0;
+        ggml_riscv_qbs_activation_plan qbs_activation_plan{};
+        const bool qbs_wide_m = is_qbs_block_type<BLOC_TYPE>::value && ne12 == 1 && ne13 == 1 &&
+                                ggml_riscv_qbs_plan_activations(
+                                    src0->type, ne11, ne01, ne10, &qbs_activation_plan) &&
+                                qbs_activation_plan.wide_m;
+        const size_t qbs_quantized_bytes = qbs_wide_m ? qbs_activation_plan.packed_bytes : nbw2 * ne12;
+        if (qbs_wide_m) {
+            GGML_ASSERT(!reuse_qbs_activation);
+            GGML_ASSERT(qbs_activation_plan.row_major_bytes == nbw2);
+            GGML_ASSERT(params->wsize >= qbs_activation_plan.workspace_bytes);
+        }
 #endif
 
         // INFO: Quantization is done in planes to avoid extra complexity in chunking.
         // Flattening dimensions not multiple of INTER_SIZE would require extra handling depending on how
         // the planes are broadcast.
 #if defined(GGML_USE_RISCV_QBS)
-        if (!reuse_qbs_activation) {
+        if (qbs_wide_m) {
+            char * row_major = wdata + qbs_activation_plan.row_major_offset;
+            for (int64_t i11 = ith; i11 < ne11; i11 += nth) {
+                from_float((float *) ((char *) src1->data + i11 * nb11),
+                           row_major + i11 * nbw1, ne10);
+            }
+            ggml_barrier(params->threadpool);
+            if (ith == 0) {
+                GGML_ASSERT(ggml_riscv_qbs_pack_wide_activations(
+                                src0->type, row_major, qbs_activation_plan.row_major_bytes,
+                                ne11, ne10, wdata, qbs_activation_plan.packed_bytes) == 0);
+            }
+        } else if (!reuse_qbs_activation) {
 #endif
         for (int64_t i12 = 0; i12 < ne12; i12++) {
             char * data_ptr  = (char *) src1->data + i12 * nb12;
@@ -4813,7 +4864,7 @@ template <typename BLOC_TYPE, int64_t INTER_SIZE, int64_t NB_COLS, ggml_type PAR
             if (ith == 0 && !reuse_qbs_activation) {
                 ggml_riscv_qbs_trace_activation_lifetime(
                     op, op->name, src0, src0->name, src0->type, src1, src1->name, src1->data,
-                    wdata, nbw2 * ne12, PARAM_TYPE, ne11 * ne12, ne10,
+                    wdata, qbs_quantized_bytes, PARAM_TYPE, ne11 * ne12, ne10,
                     ne01, params->graph_epoch,
                     quantize_time_valid, quantize_time_us);
             }

@@ -677,22 +677,24 @@ static const uint8_t * packed_weight_block(const uint8_t * weights,
 
 static void extract_interleaved_activation(const qbs_profile & profile,
                                            const uint8_t *     source,
+                                           unsigned            storage_rows,
                                            unsigned            context,
                                            uint8_t *           destination) {
     const unsigned scale_bytes        = qbs_activation_scale_bytes(profile.activation);
     const unsigned quant_bytes        = qbs_activation_quant_bytes(profile.activation);
     const unsigned aux_count          = qbs_activation_aux_count(profile.activation);
     const unsigned aux_element_bytes  = qbs_activation_aux_element_bytes(profile.activation);
-    const unsigned scale_region_bytes = 4 * scale_bytes;
-    const unsigned quant_region_bytes = 4 * quant_bytes;
+    const unsigned scale_region_bytes = storage_rows * scale_bytes;
+    const unsigned quant_region_bytes = storage_rows * quant_bytes;
 
     std::memcpy(destination, source + context * scale_bytes, scale_bytes);
     for (unsigned byte = 0; byte < quant_bytes; ++byte) {
-        destination[scale_bytes + byte] = source[scale_region_bytes + byte * 4 + context];
+        destination[scale_bytes + byte] = source[scale_region_bytes + byte * storage_rows + context];
     }
     for (unsigned item = 0; item < aux_count; ++item) {
         const size_t source_offset =
-            scale_region_bytes + quant_region_bytes + (static_cast<size_t>(item) * 4 + context) * aux_element_bytes;
+            scale_region_bytes + quant_region_bytes +
+            (static_cast<size_t>(item) * storage_rows + context) * aux_element_bytes;
         const size_t destination_offset = scale_bytes + quant_bytes + static_cast<size_t>(item) * aux_element_bytes;
         std::memcpy(destination + destination_offset, source + source_offset, aux_element_bytes);
     }
@@ -706,12 +708,18 @@ static void emulate_qbs(ggml_type    weight_type,
                         const void * activations,
                         int          input_rows,
                         int          output_rows,
-                        bool         interleaved_activations) {
+                        unsigned     activation_layout) {
     const qbs_profile profile                = profile_for_type(weight_type);
     const unsigned    block_elements         = qbs_weight_block_elements(profile.weight);
     const unsigned    weight_block_bytes     = qbs_weight_block_bytes(profile.weight);
     const unsigned    activation_block_bytes = qbs_activation_block_bytes(profile.activation);
-    assert(block_elements != 0 && input_rows > 0 && (!interleaved_activations || input_rows % 4 == 0));
+    const bool interleaved_activations = activation_layout != QBS_ACTIVATION_LAYOUT_ROW_MAJOR;
+    const unsigned storage_rows = activation_layout == QBS_ACTIVATION_LAYOUT_M8_INTERLEAVED ? QBS_MAX_M : 4u;
+    assert(block_elements != 0 && input_rows > 0 &&
+           (activation_layout == QBS_ACTIVATION_LAYOUT_ROW_MAJOR ||
+            activation_layout == QBS_ACTIVATION_LAYOUT_M4_INTERLEAVED ||
+            activation_layout == QBS_ACTIVATION_LAYOUT_M8_INTERLEAVED));
+    assert(!interleaved_activations || input_rows <= static_cast<int>(storage_rows));
     const unsigned                                      k_blocks         = static_cast<unsigned>(n / block_elements);
     const auto *                                        weight_bytes     = static_cast<const uint8_t *>(weights);
     const auto *                                        activation_bytes = static_cast<const uint8_t *>(activations);
@@ -725,9 +733,10 @@ static void emulate_qbs(ggml_type    weight_type,
             for (unsigned block = 0; block < k_blocks; ++block) {
                 const uint8_t * activation;
                 if (interleaved_activations) {
-                    const uint8_t * group = activation_bytes + ((static_cast<size_t>(input) / 4 * k_blocks + block) *
-                                                                4 * activation_block_bytes);
-                    extract_interleaved_activation(profile, group, input % 4, activation_block.data());
+                    const uint8_t * group = activation_bytes + static_cast<size_t>(block) * storage_rows *
+                                                                activation_block_bytes;
+                    extract_interleaved_activation(
+                        profile, group, storage_rows, static_cast<unsigned>(input), activation_block.data());
                     activation = activation_block.data();
                 } else {
                     activation =
@@ -946,7 +955,7 @@ static qbs_status_t execute_command(void *                      opaque,
     if (context->emulated) {
         emulate_qbs(context->weight_type, static_cast<int>(fields.k_blocks * block_elements), output, output_stride,
                     reinterpret_cast<const void *>(descriptor->weight_base), activations, static_cast<int>(m),
-                    static_cast<int>(n), fields.activation_layout == QBS_ACTIVATION_LAYOUT_M4_INTERLEAVED);
+                    static_cast<int>(n), fields.activation_layout);
     } else {
         status = qbs_native_execute_command(nullptr, descriptor, m, activations, output, output_stride, n, segmented);
     }
@@ -1046,6 +1055,78 @@ static qbs_status_t execute_plan(const qbs_plan_t &          plan,
 }
 
 }  // namespace
+
+bool ggml_riscv_qbs_plan_activations(ggml_type                          weight_type,
+                                     int64_t                            input_rows,
+                                     int64_t                            output_rows,
+                                     int64_t                            k_elements,
+                                     ggml_riscv_qbs_activation_plan * plan) {
+    if (plan == nullptr) {
+        return false;
+    }
+    *plan = {};
+    if (input_rows <= 0 || output_rows <= 0 || k_elements <= 0) {
+        return false;
+    }
+
+    const qbs_profile profile        = profile_for_type(weight_type);
+    const unsigned    block_elements = qbs_weight_block_elements(profile.weight);
+    if (profile.weight == QBS_WEIGHT_PROFILE_INVALID || profile.activation == QBS_ACTIVATION_PROFILE_INVALID ||
+        block_elements == 0 || k_elements % static_cast<int64_t>(block_elements) != 0) {
+        return false;
+    }
+    const size_t k_blocks = static_cast<size_t>(k_elements) / block_elements;
+    const size_t row_major_bytes = qbs_activation_storage_bytes(
+        profile.activation, QBS_ACTIVATION_STORAGE_ROW_MAJOR, static_cast<size_t>(input_rows), k_blocks);
+    if (row_major_bytes == 0) {
+        return false;
+    }
+
+    const qbs_activation_storage_t storage = qbs_recommend_activation_storage(
+        &device(), profile.weight, profile.activation, QBS_WEIGHT_LAYOUT_R4_BLOCK_MAJOR,
+        static_cast<size_t>(input_rows), static_cast<size_t>(output_rows), static_cast<size_t>(k_elements));
+    plan->wide_m         = storage == QBS_ACTIVATION_STORAGE_M8_GROUPED;
+    plan->packed_bytes   = row_major_bytes;
+    plan->row_major_bytes = row_major_bytes;
+    plan->workspace_bytes = row_major_bytes;
+    if (!plan->wide_m) {
+        return true;
+    }
+
+    plan->packed_bytes = qbs_activation_storage_bytes(
+        profile.activation, storage, static_cast<size_t>(input_rows), k_blocks);
+    const size_t alignment = static_cast<size_t>(1u) << QBS_ACTIVATION_BASE_ALIGNMENT_LOG2;
+    if (plan->packed_bytes == 0 || plan->packed_bytes > std::numeric_limits<size_t>::max() - (alignment - 1u)) {
+        *plan = {};
+        return false;
+    }
+    plan->row_major_offset = (plan->packed_bytes + alignment - 1u) & ~(alignment - 1u);
+    if (plan->row_major_offset > std::numeric_limits<size_t>::max() - plan->row_major_bytes) {
+        *plan = {};
+        return false;
+    }
+    plan->workspace_bytes = plan->row_major_offset + plan->row_major_bytes;
+    return true;
+}
+
+int ggml_riscv_qbs_pack_wide_activations(ggml_type    weight_type,
+                                         const void * row_major,
+                                         size_t       row_major_bytes,
+                                         int64_t      input_rows,
+                                         int64_t      k_elements,
+                                         void *       packed,
+                                         size_t       packed_bytes) {
+    const qbs_profile profile        = profile_for_type(weight_type);
+    const unsigned    block_elements = qbs_weight_block_elements(profile.weight);
+    if (input_rows < QBS_WIDE_M_MIN || k_elements <= 0 || block_elements == 0 ||
+        k_elements % static_cast<int64_t>(block_elements) != 0) {
+        return -1;
+    }
+    const qbs_status_t status = qbs_pack_activation_m8_grouped(
+        profile.activation, row_major, row_major_bytes, static_cast<size_t>(input_rows),
+        static_cast<size_t>(k_elements) / block_elements, packed, packed_bytes);
+    return status == QBS_STATUS_OK ? 0 : -1;
+}
 
 bool ggml_riscv_qbs_prepare_activation_context(const ggml_compute_params * params,
                                                const ggml_tensor *         op,
@@ -1444,14 +1525,15 @@ void ggml_riscv_qbs_gemv(ggml_type    weight_type,
     GGML_ASSERT(status == QBS_STATUS_OK);
 }
 
-void ggml_riscv_qbs_gemm(ggml_type    weight_type,
-                         int          n,
-                         float *      dst,
-                         size_t       dst_stride,
-                         const void * weights,
-                         const void * activations,
-                         int          input_rows,
-                         int          output_rows) {
+static void ggml_riscv_qbs_gemm_with_storage(ggml_type    weight_type,
+                                             int          n,
+                                             float *      dst,
+                                             size_t       dst_stride,
+                                             const void * weights,
+                                             const void * activations,
+                                             int          input_rows,
+                                             int          output_rows,
+                                             unsigned     activation_storage) {
     const qbs_profile profile        = profile_for_type(weight_type);
     const unsigned    block_elements = qbs_weight_block_elements(profile.weight);
     GGML_ASSERT(input_rows > 0 && n > 0 && block_elements != 0 && n % static_cast<int>(block_elements) == 0);
@@ -1459,7 +1541,7 @@ void ggml_riscv_qbs_gemm(ggml_type    weight_type,
         static_cast<uint8_t>(profile.weight),
         static_cast<uint8_t>(profile.activation),
         static_cast<uint8_t>(QBS_WEIGHT_LAYOUT_R4_BLOCK_MAJOR),
-        static_cast<uint8_t>(QBS_ACTIVATION_STORAGE_M4_GROUPED),
+        static_cast<uint8_t>(activation_storage),
         static_cast<uint32_t>(input_rows),
         static_cast<uint32_t>(output_rows),
         static_cast<uint32_t>(n),
@@ -1475,11 +1557,36 @@ void ggml_riscv_qbs_gemm(ggml_type    weight_type,
     };
     const size_t          weight_bytes = qbs_weight_storage_bytes(profile.weight, QBS_WEIGHT_LAYOUT_R4_BLOCK_MAJOR,
                                                                   static_cast<size_t>(output_rows), plan.k_blocks);
-    const size_t activation_bytes = qbs_activation_storage_bytes(profile.activation, QBS_ACTIVATION_STORAGE_M4_GROUPED,
-                                                                 static_cast<size_t>(input_rows), plan.k_blocks);
+    const size_t activation_bytes = qbs_activation_storage_bytes(
+        profile.activation, activation_storage, static_cast<size_t>(input_rows), plan.k_blocks);
     const size_t output_capacity  = static_cast<size_t>(input_rows - 1) * dst_stride + static_cast<size_t>(output_rows);
     const qbs_status_t status =
         execute_plan(plan, weights, weight_bytes, activations, activation_bytes, dst, output_capacity, dst_stride,
                      workspace.pointer(), workspace.size_bytes(), &context);
     GGML_ASSERT(status == QBS_STATUS_OK);
+}
+
+void ggml_riscv_qbs_gemm(ggml_type    weight_type,
+                         int          n,
+                         float *      dst,
+                         size_t       dst_stride,
+                         const void * weights,
+                         const void * activations,
+                         int          input_rows,
+                         int          output_rows) {
+    ggml_riscv_qbs_gemm_with_storage(weight_type, n, dst, dst_stride, weights, activations, input_rows, output_rows,
+                                     QBS_ACTIVATION_STORAGE_M4_GROUPED);
+}
+
+void ggml_riscv_qbs_gemm_wide(ggml_type    weight_type,
+                              int          n,
+                              float *      dst,
+                              size_t       dst_stride,
+                              const void * weights,
+                              const void * activations,
+                              int          input_rows,
+                              int          output_rows) {
+    GGML_ASSERT(input_rows >= static_cast<int>(QBS_WIDE_M_MIN));
+    ggml_riscv_qbs_gemm_with_storage(weight_type, n, dst, dst_stride, weights, activations, input_rows, output_rows,
+                                     QBS_ACTIVATION_STORAGE_M8_GROUPED);
 }

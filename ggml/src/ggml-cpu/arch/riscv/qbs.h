@@ -7,6 +7,14 @@
 
 struct ggml_compute_params;
 
+struct ggml_riscv_qbs_activation_plan {
+    bool   wide_m;
+    size_t packed_bytes;
+    size_t row_major_offset;
+    size_t row_major_bytes;
+    size_t workspace_bytes;
+};
+
 // Marker types keep the QBS layouts distinct from the standard RVV repacks.
 struct ggml_riscv_qbs_q4_k_tag {};
 
@@ -38,6 +46,23 @@ void ggml_riscv_qbs_trace_tensor_decision(const void * tensor_identity,
                                           bool         selected);
 
 bool ggml_riscv_qbs_trace_activation_lifetime_enabled();
+
+// Selects the activation layout once for a complete MUL_MAT invocation.  A
+// wide-M plan contains both the final packed region and a non-overlapping
+// row-major staging region used by the generic GGML quantizer.
+bool ggml_riscv_qbs_plan_activations(ggml_type                          weight_type,
+                                     int64_t                            input_rows,
+                                     int64_t                            output_rows,
+                                     int64_t                            k_elements,
+                                     ggml_riscv_qbs_activation_plan * plan);
+
+int ggml_riscv_qbs_pack_wide_activations(ggml_type    weight_type,
+                                         const void * row_major,
+                                         size_t       row_major_bytes,
+                                         int64_t      input_rows,
+                                         int64_t      k_elements,
+                                         void *       packed,
+                                         size_t       packed_bytes);
 
 // Returns true only when this invocation can consume an already resident,
 // semantically identical activation and may therefore skip quantization.
@@ -90,5 +115,14 @@ void ggml_riscv_qbs_gemm(ggml_type    weight_type,
                          const void * activations,
                          int          input_rows,
                          int          output_rows);
+
+void ggml_riscv_qbs_gemm_wide(ggml_type    weight_type,
+                              int          n,
+                              float *      dst,
+                              size_t       dst_stride,
+                              const void * weights,
+                              const void * activations,
+                              int          input_rows,
+                              int          output_rows);
 
 extern "C" void ggml_riscv_qbs_end_graph(uint64_t graph_epoch);
