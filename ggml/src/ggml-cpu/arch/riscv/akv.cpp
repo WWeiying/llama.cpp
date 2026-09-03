@@ -514,7 +514,8 @@ static akv_status_t emulate(void *,
             float        score = 0.0f;
             ggml_vec_dot_f16(descriptor->head_dim, &score, 0, const_cast<ggml_fp16_t *>(key), 0,
                              const_cast<ggml_fp16_t *>(query), 0, 1);
-            score = score * scale + GGML_CPU_FP16_TO_FP32(mask[token]);
+            volatile float scaled_score = score * scale;
+            score = scaled_score + GGML_CPU_FP16_TO_FP32(mask[token]);
 
             if (token == 0) {
                 maximum = score;

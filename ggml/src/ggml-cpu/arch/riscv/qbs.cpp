@@ -245,8 +245,7 @@ static bool qbs_activation_context_enabled() {
 }
 
 static bool qbs_wide_m_enabled() {
-    const char * value = std::getenv("GGML_RISCV_QBS_WIDE_M");
-    return value == nullptr || env_true("GGML_RISCV_QBS_WIDE_M");
+    return env_true("GGML_RISCV_QBS_WIDE_M");
 }
 
 static bool format_name_equal(const char * token, size_t token_size, const char * expected) {

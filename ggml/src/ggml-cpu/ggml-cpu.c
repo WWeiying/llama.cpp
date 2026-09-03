@@ -22,6 +22,7 @@
 #endif
 
 #include <assert.h>
+#include <ctype.h>
 #include <errno.h>
 #include <time.h>
 #include <math.h>
@@ -3066,6 +3067,92 @@ static int ggml_cpu_try_fuse_ops(
 
 static atomic_uint_fast64_t ggml_riscv_model_graph_sequence = 0;
 
+static const char * ggml_riscv_model_digest_spec(void) {
+    const char * value = getenv("GGML_RISCV_MODEL_DIGEST");
+    if (value == NULL || value[0] == '\0' || strcmp(value, "0") == 0 ||
+        strcmp(value, "false") == 0 || strcmp(value, "FALSE") == 0 ||
+        strcmp(value, "off") == 0 || strcmp(value, "OFF") == 0) {
+        return NULL;
+    }
+    return value;
+}
+
+static bool ggml_riscv_model_digest_token_equal(const char * begin, size_t size, const char * expected) {
+    if (strlen(expected) != size) {
+        return false;
+    }
+    for (size_t i = 0; i < size; ++i) {
+        if (toupper((unsigned char) begin[i]) != toupper((unsigned char) expected[i])) {
+            return false;
+        }
+    }
+    return true;
+}
+
+static bool ggml_riscv_model_digest_selected(const struct ggml_tensor * node, const char * spec) {
+    if (spec == NULL) {
+        return false;
+    }
+    if (strcmp(spec, "1") == 0 || strcmp(spec, "true") == 0 || strcmp(spec, "TRUE") == 0 ||
+        strcmp(spec, "all") == 0 || strcmp(spec, "ALL") == 0) {
+        return true;
+    }
+
+    const char * op_name = ggml_op_name(node->op);
+    for (const char * token = spec; *token != '\0';) {
+        while (*token == ',' || *token == ';' || isspace((unsigned char) *token)) {
+            ++token;
+        }
+        const char * end = token;
+        while (*end != '\0' && *end != ',' && *end != ';' && !isspace((unsigned char) *end)) {
+            ++end;
+        }
+        if (end != token && ggml_riscv_model_digest_token_equal(token, (size_t) (end - token), op_name)) {
+            return true;
+        }
+        token = end;
+    }
+    return false;
+}
+
+static uint64_t ggml_riscv_model_digest_bytes(uint64_t hash, const uint8_t * data, size_t size) {
+    for (size_t i = 0; i < size; ++i) {
+        hash ^= data[i];
+        hash *= UINT64_C(1099511628211);
+    }
+    return hash;
+}
+
+static void ggml_riscv_trace_model_digest(const struct ggml_tensor * node,
+                                          uint64_t                   graph_id,
+                                          int                        node_n,
+                                          const char *               spec) {
+    if (!ggml_riscv_model_digest_selected(node, spec) || node->data == NULL) {
+        return;
+    }
+
+    const size_t row_bytes = ggml_row_size(node->type, node->ne[0]);
+    uint64_t hash = UINT64_C(14695981039346656037);
+    uint64_t logical_bytes = 0;
+    for (int64_t i3 = 0; i3 < node->ne[3]; ++i3) {
+        for (int64_t i2 = 0; i2 < node->ne[2]; ++i2) {
+            for (int64_t i1 = 0; i1 < node->ne[1]; ++i1) {
+                const uint8_t * row = (const uint8_t *) node->data + i1*node->nb[1] + i2*node->nb[2] + i3*node->nb[3];
+                hash = ggml_riscv_model_digest_bytes(hash, row, row_bytes);
+                logical_bytes += row_bytes;
+            }
+        }
+    }
+
+    fprintf(stderr,
+            "GGML_RISCV_MODEL_DIGEST graph=%" PRIu64 " node=%d op=%s type=%s "
+            "ne0=%" PRId64 " ne1=%" PRId64 " ne2=%" PRId64 " ne3=%" PRId64 " "
+            "bytes=%" PRIu64 " hash=%016" PRIx64 " name=%s\n",
+            graph_id, node_n, ggml_op_name(node->op), ggml_type_name(node->type),
+            node->ne[0], node->ne[1], node->ne[2], node->ne[3], logical_bytes, hash,
+            node->name[0] != '\0' ? node->name : "<unnamed>");
+}
+
 static bool ggml_riscv_model_trace_enabled(void) {
     static int enabled = -1;
     if (enabled < 0) {
@@ -3141,8 +3228,10 @@ static thread_ret_t ggml_graph_compute_thread(void * data) {
         /*.node_index =*/ -1,
     };
 
+    const char * riscv_model_digest = ggml_riscv_model_digest_spec();
+    const bool riscv_model_observe = ggml_riscv_model_trace_enabled() || riscv_model_digest != NULL;
     uint64_t riscv_model_graph_id = 0;
-    if (state->ith == 0 && ggml_riscv_model_trace_enabled()) {
+    if (state->ith == 0 && riscv_model_observe) {
         riscv_model_graph_id = atomic_fetch_add_explicit(
             &ggml_riscv_model_graph_sequence, 1, memory_order_relaxed);
         fprintf(stderr, "GGML_RISCV_MODEL_GRAPH_BEGIN id=%" PRIu64 " nodes=%d\n",
@@ -3182,13 +3271,23 @@ static thread_ret_t ggml_graph_compute_thread(void * data) {
             ggml_compute_forward(&params, node);
         }
 
+        struct ggml_tensor * result_node = cgraph->nodes[node_n];
+
         if (state->ith == 0 && cplan->abort_callback &&
                 cplan->abort_callback(cplan->abort_callback_data)) {
             atomic_store_explicit(&tp->abort, node_n + 1, memory_order_relaxed);
             tp->ec    = GGML_STATUS_ABORTED;
         }
 
-        if (node_n + 1 < cgraph->n_nodes) {
+        if (riscv_model_digest != NULL) {
+            // Diagnostic-only synchronization: all workers must finish the node before
+            // thread 0 reads its output, and no worker may start the next node meanwhile.
+            ggml_barrier(state->threadpool);
+            if (state->ith == 0) {
+                ggml_riscv_trace_model_digest(result_node, riscv_model_graph_id, node_n, riscv_model_digest);
+            }
+            ggml_barrier(state->threadpool);
+        } else if (node_n + 1 < cgraph->n_nodes) {
             ggml_barrier(state->threadpool);
         }
     }
@@ -3206,7 +3305,7 @@ static thread_ret_t ggml_graph_compute_thread(void * data) {
     }
 #endif
 
-    if (state->ith == 0 && ggml_riscv_model_trace_enabled()) {
+    if (state->ith == 0 && riscv_model_observe) {
         fprintf(stderr, "GGML_RISCV_MODEL_GRAPH_END id=%" PRIu64 "\n", riscv_model_graph_id);
     }
 

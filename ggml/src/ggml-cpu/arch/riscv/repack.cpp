@@ -337,8 +337,7 @@ void ggml_gemv_q4_K_32x1_q8_K(int n, float * GGML_RESTRICT s, size_t bs,
                     weight_min, activation[block].d, vl);
 
             sumf = __riscv_vfmacc_vv_f32m1(sumf, dot_f, scaled_d, vl);
-            sumf = __riscv_vfsub_vv_f32m1(
-                    sumf, __riscv_vfmul_vv_f32m1(min_f, scaled_min, vl), vl);
+            sumf = __riscv_vfnmsac_vv_f32m1(sumf, min_f, scaled_min, vl);
         }
 
         __riscv_vse32_v_f32m1(s + tile * rows_per_tile, sumf, vl);
@@ -492,10 +491,10 @@ void ggml_gemm_q4_K_32x1_q8_K(int n, float * GGML_RESTRICT s, size_t bs,
                 sumf1 = __riscv_vfmacc_vv_f32m1(sumf1, dotf1, scale1, vl);
                 sumf2 = __riscv_vfmacc_vv_f32m1(sumf2, dotf2, scale2, vl);
                 sumf3 = __riscv_vfmacc_vv_f32m1(sumf3, dotf3, scale3, vl);
-                sumf0 = __riscv_vfsub_vv_f32m1(sumf0, __riscv_vfmul_vv_f32m1(minf0, dmin0, vl), vl);
-                sumf1 = __riscv_vfsub_vv_f32m1(sumf1, __riscv_vfmul_vv_f32m1(minf1, dmin1, vl), vl);
-                sumf2 = __riscv_vfsub_vv_f32m1(sumf2, __riscv_vfmul_vv_f32m1(minf2, dmin2, vl), vl);
-                sumf3 = __riscv_vfsub_vv_f32m1(sumf3, __riscv_vfmul_vv_f32m1(minf3, dmin3, vl), vl);
+                sumf0 = __riscv_vfnmsac_vv_f32m1(sumf0, minf0, dmin0, vl);
+                sumf1 = __riscv_vfnmsac_vv_f32m1(sumf1, minf1, dmin1, vl);
+                sumf2 = __riscv_vfnmsac_vv_f32m1(sumf2, minf2, dmin2, vl);
+                sumf3 = __riscv_vfnmsac_vv_f32m1(sumf3, minf3, dmin3, vl);
             }
 
             const int output = output_tile * rows_per_tile;
