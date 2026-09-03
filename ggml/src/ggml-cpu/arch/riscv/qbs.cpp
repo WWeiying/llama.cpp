@@ -388,7 +388,9 @@ static void print_trace_summary() {
                          "input_rows=%llu output_rows=%llu activation_elements=%llu "
                          "output_elements=%llu dot_elements=%llu "
                          "split_calls=%llu commands_m1=%llu commands_m2=%llu "
-                         "commands_m3=%llu commands_m4=%llu native_qbexec=%llu "
+                         "commands_m3=%llu commands_m4=%llu commands_m5=%llu "
+                         "commands_m6=%llu commands_m7=%llu commands_m8=%llu "
+                         "native_qbexec=%llu "
                          "emulated_commands=%llu command_dot_elements=%llu "
                          "segmented_commands=%llu context_fill=%llu "
                          "context_reuse=%llu context_release=%llu\n",
@@ -405,6 +407,10 @@ static void print_trace_summary() {
                          static_cast<unsigned long long>(counters.commands_by_m[1].load(std::memory_order_relaxed)),
                          static_cast<unsigned long long>(counters.commands_by_m[2].load(std::memory_order_relaxed)),
                          static_cast<unsigned long long>(counters.commands_by_m[3].load(std::memory_order_relaxed)),
+                         static_cast<unsigned long long>(counters.commands_by_m[4].load(std::memory_order_relaxed)),
+                         static_cast<unsigned long long>(counters.commands_by_m[5].load(std::memory_order_relaxed)),
+                         static_cast<unsigned long long>(counters.commands_by_m[6].load(std::memory_order_relaxed)),
+                         static_cast<unsigned long long>(counters.commands_by_m[7].load(std::memory_order_relaxed)),
                          static_cast<unsigned long long>(counters.native_qbexec.load(std::memory_order_relaxed)),
                          static_cast<unsigned long long>(counters.emulated_commands.load(std::memory_order_relaxed)),
                          static_cast<unsigned long long>(counters.command_dot_elements.load(std::memory_order_relaxed)),
