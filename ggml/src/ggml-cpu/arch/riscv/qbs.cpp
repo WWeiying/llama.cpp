@@ -244,6 +244,11 @@ static bool qbs_activation_context_enabled() {
     return value == nullptr || env_true("GGML_RISCV_QBS_ACTIVATION_CONTEXT");
 }
 
+static bool qbs_wide_m_enabled() {
+    const char * value = std::getenv("GGML_RISCV_QBS_WIDE_M");
+    return value == nullptr || env_true("GGML_RISCV_QBS_WIDE_M");
+}
+
 static bool format_name_equal(const char * token, size_t token_size, const char * expected) {
     const size_t expected_size = std::strlen(expected);
     if (token_size != expected_size) {
@@ -1065,7 +1070,9 @@ bool ggml_riscv_qbs_plan_activations(ggml_type                          weight_t
         return false;
     }
     *plan = {};
-    if (input_rows <= 0 || output_rows <= 0 || k_elements <= 0) {
+    if (input_rows <= 0 || output_rows <= 0 || k_elements <= 0 ||
+        input_rows > std::numeric_limits<int>::max() || output_rows > std::numeric_limits<int>::max() ||
+        k_elements > std::numeric_limits<int>::max()) {
         return false;
     }
 
@@ -1082,9 +1089,11 @@ bool ggml_riscv_qbs_plan_activations(ggml_type                          weight_t
         return false;
     }
 
-    const qbs_activation_storage_t storage = qbs_recommend_activation_storage(
-        &device(), profile.weight, profile.activation, QBS_WEIGHT_LAYOUT_R4_BLOCK_MAJOR,
-        static_cast<size_t>(input_rows), static_cast<size_t>(output_rows), static_cast<size_t>(k_elements));
+    const qbs_activation_storage_t storage = qbs_wide_m_enabled()
+        ? qbs_recommend_activation_storage(
+              &device(), profile.weight, profile.activation, QBS_WEIGHT_LAYOUT_R4_BLOCK_MAJOR,
+              static_cast<size_t>(input_rows), static_cast<size_t>(output_rows), static_cast<size_t>(k_elements))
+        : (input_rows >= 4 ? QBS_ACTIVATION_STORAGE_M4_GROUPED : QBS_ACTIVATION_STORAGE_ROW_MAJOR);
     plan->wide_m         = storage == QBS_ACTIVATION_STORAGE_M8_GROUPED;
     plan->packed_bytes   = row_major_bytes;
     plan->row_major_bytes = row_major_bytes;
