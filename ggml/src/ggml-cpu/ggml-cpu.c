@@ -3077,6 +3077,70 @@ static const char * ggml_riscv_model_digest_spec(void) {
     return value;
 }
 
+static const char * ggml_riscv_model_dump_f32_spec(void) {
+    const char * value = getenv("GGML_RISCV_MODEL_DUMP_F32");
+    return value != NULL && value[0] != '\0' ? value : NULL;
+}
+
+static bool ggml_riscv_model_dump_f32_selected(uint64_t graph_id, int node_n, const char * spec) {
+    if (spec == NULL) {
+        return false;
+    }
+
+    char * graph_end = NULL;
+    errno = 0;
+    const uint64_t selected_graph = strtoull(spec, &graph_end, 10);
+    if (errno != 0 || graph_end == spec || *graph_end != ':') {
+        return false;
+    }
+
+    char * node_end = NULL;
+    errno = 0;
+    const long selected_node = strtol(graph_end + 1, &node_end, 10);
+    return errno == 0 && node_end != graph_end + 1 && *node_end == '\0' &&
+           selected_node >= 0 && selected_node <= INT_MAX &&
+           selected_graph == graph_id && selected_node == node_n;
+}
+
+static void ggml_riscv_trace_model_dump_f32(const struct ggml_tensor * node,
+                                            uint64_t                   graph_id,
+                                            int                        node_n,
+                                            const char *               spec) {
+    if (!ggml_riscv_model_dump_f32_selected(graph_id, node_n, spec) ||
+        node->type != GGML_TYPE_F32 || node->data == NULL) {
+        return;
+    }
+
+    fprintf(stderr,
+            "GGML_RISCV_MODEL_F32_BEGIN graph=%" PRIu64 " node=%d "
+            "ne0=%" PRId64 " ne1=%" PRId64 " ne2=%" PRId64 " ne3=%" PRId64 "\n",
+            graph_id, node_n, node->ne[0], node->ne[1], node->ne[2], node->ne[3]);
+    uint64_t row_index = 0;
+    for (int64_t i3 = 0; i3 < node->ne[3]; ++i3) {
+        for (int64_t i2 = 0; i2 < node->ne[2]; ++i2) {
+            for (int64_t i1 = 0; i1 < node->ne[1]; ++i1, ++row_index) {
+                const uint8_t * row = (const uint8_t *) node->data +
+                                      i1*node->nb[1] + i2*node->nb[2] + i3*node->nb[3];
+                fprintf(stderr,
+                        "GGML_RISCV_MODEL_F32 graph=%" PRIu64 " node=%d row=%" PRIu64 " data=",
+                        graph_id, node_n, row_index);
+                for (int64_t i0 = 0; i0 < node->ne[0]; ++i0) {
+                    uint32_t bits;
+                    memcpy(&bits, row + i0*node->nb[0], sizeof(bits));
+                    fprintf(stderr, "%08" PRIx32 "%c", bits, i0 + 1 == node->ne[0] ? '\n' : ',');
+                }
+            }
+        }
+    }
+    fprintf(stderr, "GGML_RISCV_MODEL_F32_END graph=%" PRIu64 " node=%d rows=%" PRIu64 "\n",
+            graph_id, node_n, row_index);
+    const char * exit_after_dump = getenv("GGML_RISCV_MODEL_EXIT_AFTER_DUMP");
+    if (exit_after_dump != NULL && strcmp(exit_after_dump, "1") == 0) {
+        fflush(stderr);
+        _Exit(EXIT_SUCCESS);
+    }
+}
+
 static bool ggml_riscv_model_digest_token_equal(const char * begin, size_t size, const char * expected) {
     if (strlen(expected) != size) {
         return false;
@@ -3229,7 +3293,9 @@ static thread_ret_t ggml_graph_compute_thread(void * data) {
     };
 
     const char * riscv_model_digest = ggml_riscv_model_digest_spec();
-    const bool riscv_model_observe = ggml_riscv_model_trace_enabled() || riscv_model_digest != NULL;
+    const char * riscv_model_dump_f32 = ggml_riscv_model_dump_f32_spec();
+    const bool riscv_model_observe = ggml_riscv_model_trace_enabled() ||
+                                     riscv_model_digest != NULL || riscv_model_dump_f32 != NULL;
     uint64_t riscv_model_graph_id = 0;
     if (state->ith == 0 && riscv_model_observe) {
         riscv_model_graph_id = atomic_fetch_add_explicit(
@@ -3279,12 +3345,14 @@ static thread_ret_t ggml_graph_compute_thread(void * data) {
             tp->ec    = GGML_STATUS_ABORTED;
         }
 
-        if (riscv_model_digest != NULL) {
+        if (riscv_model_digest != NULL || riscv_model_dump_f32 != NULL) {
             // Diagnostic-only synchronization: all workers must finish the node before
             // thread 0 reads its output, and no worker may start the next node meanwhile.
             ggml_barrier(state->threadpool);
             if (state->ith == 0) {
                 ggml_riscv_trace_model_digest(result_node, riscv_model_graph_id, node_n, riscv_model_digest);
+                ggml_riscv_trace_model_dump_f32(
+                    result_node, riscv_model_graph_id, node_n, riscv_model_dump_f32);
             }
             ggml_barrier(state->threadpool);
         } else if (node_n + 1 < cgraph->n_nodes) {

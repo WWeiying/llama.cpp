@@ -1,5 +1,6 @@
 #include "akv.h"
 
+#include "../../common.h"
 #include "../../ggml-cpu-impl.h"
 #include "../../vec.h"
 #include "akv/akv.h"
@@ -14,6 +15,9 @@
 #include <limits>
 
 namespace {
+
+static_assert(AKV_PREFILL_QUERY_BLOCK_TOKENS == GGML_FA_TILE_Q,
+              "AKV Prefill blocks must track GGML's tiled-attention query block");
 
 enum class support_reason {
     supported,
@@ -398,7 +402,10 @@ static support_reason supports_prefill(const ggml_compute_params * params,
                                        uint64_t *                 attention_pairs,
                                        uint32_t *                 q_rows,
                                        uint32_t *                 head_dim) {
-    constexpr int64_t min_query_tokens = 15;
+    // Below GGML_FA_TILE_Q, upstream uses its numerically distinct one-chunk
+    // path. AKV follows the tiled contract and takes over only where GGML
+    // itself transitions to tiled Prefill attention.
+    constexpr int64_t min_query_tokens = GGML_FA_TILE_Q;
     const ggml_tensor * q     = dst->src[0];
     const ggml_tensor * k     = dst->src[1];
     const ggml_tensor * v     = dst->src[2];
