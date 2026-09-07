@@ -489,6 +489,10 @@ function(ggml_add_cpu_backend_variant_impl tag_name)
                 ${GGML_RISCV_AKV_RUNTIME_DIR}/src/akv_attention_rvv.S
                 ${GGML_RISCV_AKV_RUNTIME_DIR}/src/akv_v2_attention_rvv.S
                 )
+            if (EXISTS "${GGML_RISCV_AKV_RUNTIME_DIR}/src/akv_features.c")
+                list(APPEND GGML_CPU_SOURCES
+                    ${GGML_RISCV_AKV_RUNTIME_DIR}/src/akv_features.c)
+            endif()
         endif()
         if (GGML_CPU_RISCV64_SPACEMIT)
             include(ggml-cpu/cmake/FindSMTIME.cmake)
