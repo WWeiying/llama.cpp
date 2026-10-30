@@ -4,6 +4,9 @@
 #include "../../ggml-cpu-impl.h"
 #include "../../vec.h"
 #include "akv/akv.h"
+#ifdef GGML_USE_RISCV_QUANT_KV
+#include "quant-kv.h"
+#endif
 #if __has_include("akv/akv_features.h")
 #include "akv/akv_features.h"
 #define GGML_AKV_PORTABLE_FEATURES 1
@@ -109,12 +112,14 @@ static bool decode_features(const ggml_tensor * dst, uint32_t first_head, uint32
     while (head_pow2 <= heads / 2u) {
         head_pow2 *= 2u;
     }
-    const float m0 = std::pow(2.0f, -max_bias / head_pow2);
-    const float m1 = std::pow(2.0f, -(max_bias / 2.0f) / head_pow2);
+    const float m0 = features->mask_scale_enabled ? std::pow(2.0f, -max_bias / head_pow2) : 1.0f;
+    const float m1 = features->mask_scale_enabled ? std::pow(2.0f, -(max_bias / 2.0f) / head_pow2) : 1.0f;
     for (uint32_t head = 0; head < rows; ++head) {
         const uint32_t h = first_head + head;
-        features->mask_scale[head] = h < head_pow2 ? std::pow(m0, h + 1)
-            : std::pow(m1, 2u * (h - head_pow2) + 1u);
+        if (features->mask_scale_enabled) {
+            features->mask_scale[head] = h < head_pow2 ? std::pow(m0, h + 1)
+                : std::pow(m1, 2u * (h - head_pow2) + 1u);
+        }
         if (sinks) {
             features->sinks[head] = static_cast<const float *>(sinks->data)[h];
         }
@@ -591,12 +596,17 @@ static support_reason supports_prefill(const ggml_compute_params * params,
     return *past_tokens >= 0 ? support_reason::supported : support_reason::mask;
 }
 
-static akv_status_t emulate(void *,
+static akv_status_t emulate(void * context,
                             const akv_descriptor_t * descriptor,
                             const uint16_t *         mask,
                             float *                  output,
                             size_t                   output_stride,
                             float                    scale) {
+#ifdef GGML_AKV_PORTABLE_FEATURES
+    const auto * features = static_cast<const akv_attention_features_t *>(context);
+#else
+    GGML_UNUSED(context);
+#endif
     for (uint32_t head = 0; head < descriptor->q_rows; ++head) {
         const auto * query = reinterpret_cast<const ggml_fp16_t *>(static_cast<uintptr_t>(descriptor->q_base) +
                                                                    head * descriptor->q_row_stride_bytes);
@@ -605,6 +615,9 @@ static akv_status_t emulate(void *,
         float                                     sum     = 0.0f;
 
         for (uint32_t token = 0; token < descriptor->kv_length; ++token) {
+            if (mask[token] == 0xfc00u) {
+                continue;
+            }
             const auto * key   = reinterpret_cast<const ggml_fp16_t *>(static_cast<uintptr_t>(descriptor->k_base) +
                                                                        token * descriptor->k_token_stride_bytes);
             const auto * value = reinterpret_cast<const ggml_fp16_t *>(static_cast<uintptr_t>(descriptor->v_base) +
@@ -612,10 +625,20 @@ static akv_status_t emulate(void *,
             float        score = 0.0f;
             ggml_vec_dot_f16(descriptor->head_dim, &score, 0, const_cast<ggml_fp16_t *>(key), 0,
                              const_cast<ggml_fp16_t *>(query), 0, 1);
-            volatile float scaled_score = score * scale;
-            score = scaled_score + GGML_CPU_FP16_TO_FP32(mask[token]);
+#ifdef GGML_AKV_PORTABLE_FEATURES
+            if (features) {
+                score = akv_attention_score_transform(score, scale, mask[token], head, token, features);
+                if (score == -INFINITY) {
+                    continue;
+                }
+            } else
+#endif
+            {
+                volatile float scaled_score = score * scale;
+                score = scaled_score + GGML_CPU_FP16_TO_FP32(mask[token]);
+            }
 
-            if (token == 0) {
+            if (sum == 0.0f) {
                 maximum = score;
                 sum     = 1.0f;
                 std::copy(value, value + descriptor->head_dim, accumulator.begin());
@@ -631,10 +654,24 @@ static akv_status_t emulate(void *,
             maximum = new_maximum;
         }
 
+        float output_scale = 1.0f;
+#ifdef GGML_AKV_PORTABLE_FEATURES
+        // GGML adds sinks after converting the Value accumulator to F32.
+        if (features && features->sinks_enabled) {
+            const float sink = features->sinks[head];
+            float weight = 1.0f;
+            if (sink > maximum) {
+                output_scale = std::exp(maximum - sink);
+            } else {
+                weight = std::exp(sink - maximum);
+            }
+            sum = sum * output_scale + weight;
+        }
+#endif
         auto *      row     = reinterpret_cast<float *>(reinterpret_cast<char *>(output) + head * output_stride);
         const float inverse = sum == 0.0f ? 0.0f : 1.0f / sum;
         for (uint32_t element = 0; element < descriptor->head_dim; ++element) {
-            row[element] = GGML_CPU_FP16_TO_FP32(accumulator[element]) * inverse;
+            row[element] = (GGML_CPU_FP16_TO_FP32(accumulator[element]) * output_scale) * inverse;
         }
     }
     return AKV_STATUS_OK;
@@ -651,6 +688,18 @@ static akv_status_t execute(const akv_attention_plan_t * plan, akv_attention_v2_
 }  // namespace
 
 bool ggml_riscv_akv_flash_attn(const ggml_compute_params * params, ggml_tensor * dst) {
+#ifdef GGML_USE_RISCV_QUANT_KV
+    if (env_true("GGML_RISCV_AKV_QUANT_KV")) {
+        std::lock_guard<std::mutex> context_lock(context_mutex());
+        const auto status = ggml_riscv_quant_kv_flash_attn(params, dst);
+        if (status == ggml_riscv_quant_kv_status::complete) {
+            return true;
+        }
+        if (status == ggml_riscv_quant_kv_status::failed) {
+            GGML_ABORT("Quantized KV Attention failed after admission");
+        }
+    }
+#endif
     register_trace();
     const bool trace_enabled = env_true("GGML_RISCV_AKV_TRACE");
     if (trace_enabled && params->ith == 0) {
@@ -671,6 +720,11 @@ bool ggml_riscv_akv_flash_attn(const ggml_compute_params * params, ggml_tensor *
     if (reason != support_reason::supported) {
         if (trace_enabled && params->ith == 0) {
             trace.fallback[fallback_index(reason)].fetch_add(1, std::memory_order_relaxed);
+            static const char * names[] = {"supported", "runtime", "capability", "threading",
+                                           "feature", "shape", "layout", "mask", "size"};
+            std::fprintf(stderr, "GGML_RISCV_AKV_FALLBACK mode=%s reason=%s portable=%d\n",
+                         dst->src[0] && dst->src[0]->ne[1] == 1 ? "decode" : "prefill",
+                         names[static_cast<size_t>(reason)], portable_decode_enabled());
             if (is_prefill && reason == support_reason::layout) {
                 report_prefill_layout_once(dst);
             }
@@ -805,9 +859,13 @@ bool ggml_riscv_akv_flash_attn(const ggml_compute_params * params, ggml_tensor *
         if (portable) {
             akv_attention_features_t features{};
             GGML_ASSERT(decode_features(dst, static_cast<uint32_t>(first_q_head), rows, active_kv, &features));
-            execute_status = emulation_enabled()
-                ? akv_attention_execute_v2_with_features_reference(&plan, &features)
-                : akv_attention_execute_v2_with_features_native(&plan, &workspace, &features);
+            if (akv_attention_can_use_plain_scores(&features, plan.mask, plan.descriptor.kv_length)) {
+                execute_status = execute(&plan, &workspace);
+            } else {
+                execute_status = emulation_enabled()
+                    ? akv_attention_execute_v2(&plan, emulate, &features)
+                    : akv_attention_execute_v2_with_features_native(&plan, &workspace, &features);
+            }
         } else
 #endif
         {
@@ -840,11 +898,14 @@ bool ggml_riscv_akv_flash_attn(const ggml_compute_params * params, ggml_tensor *
         }
         std::fprintf(stderr,
                      "GGML_RISCV_AKV_EXEC mode=decode kernel=v%u kv_heads=%llu q_rows=%llu gqa_rows=%u head_dim=%u "
-                     "active_kv=%d attention_macs=%llu\n",
+                     "active_kv=%d attention_macs=%llu groups=%llu portable=%d softcap=%g max_bias=%g sinks=%d\n",
                      kernel_version,
                      static_cast<unsigned long long>(k->ne[2]),
                      static_cast<unsigned long long>(q->ne[2]), q_rows, head_dim, active_kv,
-                     static_cast<unsigned long long>(attention_macs));
+                     static_cast<unsigned long long>(attention_macs),
+                     static_cast<unsigned long long>(groups_executed), portable,
+                     static_cast<double>(ggml_get_op_params_f32(dst, 2)),
+                     static_cast<double>(ggml_get_op_params_f32(dst, 1)), dst->src[4] != nullptr);
     }
     return true;
 }

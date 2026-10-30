@@ -1,3 +1,4 @@
+#include "arch/riscv/qbs-strided-input.h"
 #define GGML_COMMON_IMPL_CPP
 #define GGML_COMMON_DECL_CPP
 #include "ggml-common.h"
@@ -13,6 +14,9 @@
 
 #if defined(GGML_USE_RISCV_QBS)
 #include "arch/riscv/qbs.h"
+#include "arch/riscv/q8_0-m4.h"
+#include "arch/riscv/q8_K-m4-packed.h"
+#include "arch/riscv/q8_K-prepared-reuse.h"
 #endif
 
 #include <cmath>
@@ -342,6 +346,24 @@ template <> void ggml_quantize_mat_t<8, GGML_TYPE_Q8_K>(const float * GGML_RESTR
     ggml_quantize_mat_q8_K_4x8(x, vy, n_per_row);
 }
 
+#if defined(GGML_USE_RISCV_QBS)
+static bool qbs_m4_prepare_enabled() {
+    static const bool enabled = [] {
+        const char * value = std::getenv("GGML_RISCV_QBS_M4_PREPARE");
+        return value && std::strcmp(value, "1") == 0;
+    }();
+    return enabled;
+}
+
+static bool qbs_m4_prepare_trace_enabled() {
+    static const bool enabled = [] {
+        const char * value = std::getenv("GGML_RISCV_QBS_TRACE_M4_PREPARE");
+        return value && std::strcmp(value, "1") == 0;
+    }();
+    return enabled;
+}
+#endif
+
 #if defined(__riscv_zvfh) || defined(GGML_USE_RISCV_QBS)
 template <> void ggml_quantize_mat_t<1, GGML_TYPE_Q8_0>(const float * GGML_RESTRICT x, void * GGML_RESTRICT vy, int64_t nrow, int64_t n_per_row) {
     assert(nrow == 4);
@@ -349,7 +371,17 @@ template <> void ggml_quantize_mat_t<1, GGML_TYPE_Q8_0>(const float * GGML_RESTR
 #if defined __riscv_zvfh
     ggml_quantize_mat_q8_0_4x1(x, vy, n_per_row);
 #else
-    ggml_quantize_mat_q8_0_4x1_generic(x, vy, n_per_row);
+    const bool enabled = qbs_m4_prepare_enabled();
+    bool vector_used = false;
+    if (enabled) {
+        vector_used = ggml_riscv_q8_0_m4::quantize(x, vy, n_per_row);
+    } else {
+        ggml_quantize_mat_q8_0_4x1_generic(x, vy, n_per_row);
+    }
+    if (qbs_m4_prepare_trace_enabled()) {
+        std::fprintf(stderr, "GGML_RISCV_QBS_M4_PREPARE enabled=%d path=%s k=%lld\n",
+                     int(enabled), vector_used ? "rvv" : "generic", (long long) n_per_row);
+    }
 #endif
 }
 #endif
@@ -357,7 +389,24 @@ template <> void ggml_quantize_mat_t<1, GGML_TYPE_Q8_0>(const float * GGML_RESTR
 template <> void ggml_quantize_mat_t<1, GGML_TYPE_Q8_K>(const float * GGML_RESTRICT x, void * GGML_RESTRICT vy, int64_t nrow, int64_t n_per_row) {
     assert(nrow == 4);
     UNUSED(nrow);
+#if defined(GGML_USE_RISCV_QBS)
+    const bool enabled = qbs_m4_prepare_enabled();
+    bool vector_used = false;
+    if (enabled) {
+        vector_used = ggml_riscv_q8_K_m4_packed::selected_quantize(x, vy, n_per_row);
+    } else {
+        ggml_quantize_mat_q8_K_4x1_ara_generic(x, vy, n_per_row);
+    }
+    if (qbs_m4_prepare_trace_enabled()) {
+        std::fprintf(stderr, "GGML_RISCV_QBS_Q8K_M4_PREPARE enabled=%d path=%s k=%lld\n",
+                     int(enabled), vector_used ? "rvv" : "generic", (long long) n_per_row);
+        std::fprintf(stderr, "GGML_RISCV_QBS_M4_SELECTED source=direct tag=%u path=%s k=%lld\n",
+                     enabled ? ggml_riscv_q8_K_m4_packed::producer_tag() : 0u,
+                     vector_used ? "rvv" : "generic", (long long)n_per_row);
+    }
+#else
     ggml_quantize_mat_q8_K_4x1_ara_generic(x, vy, n_per_row);
+#endif
 }
 
 template <int M, int N>
@@ -4572,6 +4621,15 @@ class tensor_traits_base : public ggml::cpu::tensor_traits {
 };
 
 template <typename BLOC_TYPE, int64_t INTER_SIZE, int64_t NB_COLS, ggml_type PARAM_TYPE> class tensor_traits : public tensor_traits_base {
+  public:
+    explicit tensor_traits(unsigned segment_k_blocks = 0) : qbs_segment_k_blocks(segment_k_blocks) {}
+
+  private:
+    const unsigned qbs_segment_k_blocks;
+
+    bool qbs_allows_wide(const ggml_tensor * weights) const {
+        return qbs_segment_k_blocks == 0 || weights->ne[0] / ggml_blck_size(weights->type) <= qbs_segment_k_blocks;
+    }
 
     bool work_size(int /* n_threads */, const struct ggml_tensor * op, size_t & size) override {
         // not realy a GGML_TYPE_Q8_0 but same size.
@@ -4582,7 +4640,7 @@ template <typename BLOC_TYPE, int64_t INTER_SIZE, int64_t NB_COLS, ggml_type PAR
 #if defined(GGML_USE_RISCV_QBS)
                     if constexpr (is_qbs_block_type<BLOC_TYPE>::value) {
                         ggml_riscv_qbs_activation_plan activation_plan{};
-                        if (op->src[1]->ne[2] == 1 && op->src[1]->ne[3] == 1 &&
+                        if (qbs_allows_wide(op->src[0]) && op->src[1]->ne[2] == 1 && op->src[1]->ne[3] == 1 &&
                             ggml_riscv_qbs_plan_activations(op->src[0]->type, op->src[1]->ne[1],
                                                            op->src[0]->ne[1], op->src[1]->ne[0],
                                                            &activation_plan) &&
@@ -4668,9 +4726,16 @@ template <typename BLOC_TYPE, int64_t INTER_SIZE, int64_t NB_COLS, ggml_type PAR
 #if defined(GGML_USE_RISCV_QBS)
         if constexpr (is_qbs_block_type<BLOC_TYPE>::value) {
             ggml_riscv_qbs_activation_plan activation_plan{};
-            const bool wide_m = ne12 == 1 && ne13 == 1 && src1_start == 0 && nrows == ne11 &&
+            const bool wide_m = qbs_allows_wide(src0) && ne12 == 1 && ne13 == 1 && src1_start == 0 && nrows == ne11 &&
                                 ggml_riscv_qbs_plan_activations(
                                     src0->type, ne11, ne01, ne10, &activation_plan) && activation_plan.wide_m;
+            if (qbs_segment_k_blocks != 0) {
+                ggml_riscv_qbs_mul_mat_view(
+                    src0->type, ne00, (float *) dst_ptr + src0_start, nb1 / nb0,
+                    src0->data, src1_ptr, static_cast<int>(nrows), static_cast<int>(ncols),
+                    ggml_nrows(src0), i02 * ne01 + src0_start, qbs_segment_k_blocks, wide_m);
+                return;
+            }
             if (wide_m) {
                 GGML_ASSERT(activation_plan.packed_bytes <= params->wsize);
                 ggml_riscv_qbs_gemm_wide(
@@ -4762,7 +4827,7 @@ template <typename BLOC_TYPE, int64_t INTER_SIZE, int64_t NB_COLS, ggml_type PAR
         const uint64_t quantize_time_start_us = quantize_time_valid ? ggml_time_us() : 0;
         uint64_t quantize_time_us = 0;
         ggml_riscv_qbs_activation_plan qbs_activation_plan{};
-        const bool qbs_wide_m = is_qbs_block_type<BLOC_TYPE>::value && ne12 == 1 && ne13 == 1 &&
+        const bool qbs_wide_m = is_qbs_block_type<BLOC_TYPE>::value && qbs_allows_wide(src0) && ne12 == 1 && ne13 == 1 &&
                                 ggml_riscv_qbs_plan_activations(
                                     src0->type, ne11, ne01, ne10, &qbs_activation_plan) &&
                                 qbs_activation_plan.wide_m;
@@ -4781,8 +4846,15 @@ template <typename BLOC_TYPE, int64_t INTER_SIZE, int64_t NB_COLS, ggml_type PAR
         if (qbs_wide_m) {
             char * row_major = wdata + qbs_activation_plan.row_major_offset;
             for (int64_t i11 = ith; i11 < ne11; i11 += nth) {
+                if (nb10 != sizeof(float)) {
+                    constexpr size_t block = PARAM_TYPE == GGML_TYPE_Q8_K ? 256 : 32;
+                    constexpr size_t bytes = PARAM_TYPE == GGML_TYPE_Q8_K ? sizeof(block_q8_K) : sizeof(block_q8_0);
+                    ggml_qbs_strided_input::quantize<1, block, bytes>(
+                        (char *)src1->data + i11*nb11, row_major + i11*nbw1, ne10, nb10, nb11, from_float);
+                } else {
                 from_float((float *) ((char *) src1->data + i11 * nb11),
                            row_major + i11 * nbw1, ne10);
+                }
             }
             ggml_barrier(params->threadpool);
             if (ith == 0) {
@@ -4792,21 +4864,61 @@ template <typename BLOC_TYPE, int64_t INTER_SIZE, int64_t NB_COLS, ggml_type PAR
             }
         } else if (!reuse_qbs_activation) {
 #endif
+#if defined(GGML_USE_RISCV_QBS)
+        ggml_riscv_q8_K_prepared::state *m4_cache=nullptr;
+        ggml_riscv_m4_reuse::policy m4_policy{};
+        if constexpr (is_qbs_block_type<BLOC_TYPE>::value && INTER_SIZE==1 && PARAM_TYPE==GGML_TYPE_Q8_K) {
+            if(qbs_m4_prepare_enabled() && ggml_riscv_q8_K_prepared::enabled()) {
+                m4_cache=&ggml_riscv_q8_K_prepared::worker_state();
+                m4_policy=m4_cache->begin(params,op);
+            }
+        }
+#endif
         for (int64_t i12 = 0; i12 < ne12; i12++) {
             char * data_ptr  = (char *) src1->data + i12 * nb12;
             char * wdata_ptr = wdata + i12 * nbw2;
 
             for (int64_t i11 = ith * 4; i11 < ne11 - ne11 % 4; i11 += nth * 4) {
+#if defined(GGML_USE_RISCV_QBS)
+                if(m4_cache && m4_cache->prepare(m4_policy,(float *)(data_ptr+i11*nb11),
+                        wdata_ptr+i11*nbw1,ne10,i11/4,qbs_m4_prepare_trace_enabled())) {
+                    continue;
+                }
+#endif
+                if constexpr (INTER_SIZE == 1 &&
+                              (PARAM_TYPE == GGML_TYPE_Q8_K || PARAM_TYPE == GGML_TYPE_Q8_0)) {
+                    if (nb10 != sizeof(float) || nb11 != size_t(ne10)*sizeof(float)) {
+                        constexpr size_t block = PARAM_TYPE == GGML_TYPE_Q8_K ? 256 : 32;
+                        constexpr size_t bytes = PARAM_TYPE == GGML_TYPE_Q8_K ? sizeof(block_q8_K) : sizeof(block_q8_0);
+                        ggml_qbs_strided_input::quantize<4, block, 4*bytes>(
+                            data_ptr + i11*nb11, wdata_ptr + i11*nbw1, ne10, nb10, nb11,
+                            [](const float *x, void *y, int64_t k) {
+                                ggml_quantize_mat_t<INTER_SIZE, PARAM_TYPE>(x, y, 4, k);
+                            });
+                        continue;
+                    }
+                }
                 ggml_quantize_mat_t<INTER_SIZE, PARAM_TYPE>((float *) (data_ptr + i11 * nb11),
                                                             (void *) (wdata_ptr + i11 * nbw1), 4, ne10);
             }
 
             const int64_t i11_processed = ne11 - ne11 % 4;
             for (int64_t i11 = i11_processed + ith; i11 < ne11; i11 += nth) {
+                if constexpr (INTER_SIZE == 1 &&
+                              (PARAM_TYPE == GGML_TYPE_Q8_K || PARAM_TYPE == GGML_TYPE_Q8_0)) {
+                    if (nb10 != sizeof(float)) {
+                        constexpr size_t block = PARAM_TYPE == GGML_TYPE_Q8_K ? 256 : 32;
+                        constexpr size_t bytes = PARAM_TYPE == GGML_TYPE_Q8_K ? sizeof(block_q8_K) : sizeof(block_q8_0);
+                        ggml_qbs_strided_input::quantize<1, block, bytes>(
+                            data_ptr + i11*nb11, wdata_ptr + i11*nbw1, ne10, nb10, nb11, from_float);
+                        continue;
+                    }
+                }
                 from_float((float *) (data_ptr + i11 * nb11), (void *) (wdata_ptr + i11 * nbw1), ne10);
             }
         }
 #if defined(GGML_USE_RISCV_QBS)
+        if(m4_cache) m4_cache->finish(m4_policy);
         }
 #endif
 
@@ -4866,7 +4978,7 @@ template <typename BLOC_TYPE, int64_t INTER_SIZE, int64_t NB_COLS, ggml_type PAR
                     op, op->name, src0, src0->name, src0->type, src1, src1->name, src1->data,
                     wdata, qbs_quantized_bytes, PARAM_TYPE, ne11 * ne12, ne10,
                     ne01, params->graph_epoch,
-                    quantize_time_valid, quantize_time_us);
+                    quantize_time_valid, quantize_time_us, ggml_riscv_q8_K_prepared::enabled());
             }
         }
 #endif
@@ -5028,6 +5140,17 @@ template <typename BLOC_TYPE, int64_t INTER_SIZE, int64_t NB_COLS, ggml_type PAR
 
                 const auto * src1_col = (const char *) wdata + (i11 * nbw1 + i12 * nbw2);
 
+#if defined(GGML_USE_RISCV_QBS)
+                if constexpr (is_qbs_block_type<BLOC_TYPE>::value) {
+                    if (qbs_segment_k_blocks != 0) {
+                        ggml_riscv_qbs_mul_mat_view(
+                            src0->type, ne00, (float *) ((char *) dst->data + (i1 * nb1 + i2 * nb2)) + src0_cur_start,
+                            ne01, src0->data, src1_col, 1, src0_cur_end - src0_cur_start,
+                            ggml_nrows(src0), cur_a * ne01 + src0_cur_start, qbs_segment_k_blocks, false);
+                        continue;
+                    }
+                }
+#endif
                 gemv<BLOC_TYPE, INTER_SIZE, NB_COLS, PARAM_TYPE>(
                     ne00, (float *) ((char *) dst->data + (i1 * nb1 + i2 * nb2)) + src0_cur_start, ne01,
                     src0_cur + src0_cur_start * nb01, src1_col, 1, src0_cur_end - src0_cur_start);
@@ -5039,6 +5162,16 @@ template <typename BLOC_TYPE, int64_t INTER_SIZE, int64_t NB_COLS, ggml_type PAR
     int repack(struct ggml_tensor * t, const void * data, size_t data_size) override {
         GGML_LOG_DEBUG("%s: repack tensor %s with %s_%dx%d\n", __func__, t->name, ggml_type_name(t->type),
                        (int) NB_COLS, (int) INTER_SIZE);
+#if defined(GGML_USE_RISCV_QBS)
+        if constexpr (is_qbs_block_type<BLOC_TYPE>::value) {
+            if (qbs_segment_k_blocks != 0) {
+                const size_t padded_rows = (static_cast<size_t>(ggml_nrows(t)) + 3) & ~size_t(3);
+                return ggml_riscv_qbs_repack_r4(t->type, t->data, ggml_row_size(t->type, t->ne[0]) * padded_rows,
+                                               data, data_size, ggml_nrows(t), t->ne[0] / ggml_blck_size(t->type),
+                                               qbs_segment_k_blocks);
+            }
+        }
+#endif
         return ggml::cpu::repack::repack<BLOC_TYPE, INTER_SIZE, NB_COLS>(t, data, data_size);
     }
 };
@@ -5047,15 +5180,16 @@ template <typename BLOC_TYPE, int64_t INTER_SIZE, int64_t NB_COLS, ggml_type PAR
 
 static const ggml::cpu::tensor_traits * ggml_repack_get_optimal_repack_type(const struct ggml_tensor * cur) {
 #if defined(GGML_USE_RISCV_QBS)
-    static const ggml::cpu::repack::tensor_traits<ggml_riscv_qbs_q4_k_tag, 1, 4, GGML_TYPE_Q8_K> qbs_q4_K;
-    static const ggml::cpu::repack::tensor_traits<ggml_riscv_qbs_q5_k_tag, 1, 4, GGML_TYPE_Q8_K> qbs_q5_K;
-    static const ggml::cpu::repack::tensor_traits<ggml_riscv_qbs_q6_k_tag, 1, 4, GGML_TYPE_Q8_K> qbs_q6_K;
-    static const ggml::cpu::repack::tensor_traits<ggml_riscv_qbs_q3_k_tag, 1, 4, GGML_TYPE_Q8_K> qbs_q3_K;
-    static const ggml::cpu::repack::tensor_traits<ggml_riscv_qbs_q8_0_tag, 1, 4, GGML_TYPE_Q8_0> qbs_q8_0;
-    static const ggml::cpu::repack::tensor_traits<ggml_riscv_qbs_q4_0_tag, 1, 4, GGML_TYPE_Q8_0> qbs_q4_0;
-    static const ggml::cpu::repack::tensor_traits<ggml_riscv_qbs_q2_k_tag, 1, 4, GGML_TYPE_Q8_K> qbs_q2_K;
-    static const ggml::cpu::repack::tensor_traits<ggml_riscv_qbs_q5_0_tag, 1, 4, GGML_TYPE_Q8_0> qbs_q5_0;
-    static const ggml::cpu::repack::tensor_traits<ggml_riscv_qbs_iq4_nl_tag, 1, 4, GGML_TYPE_Q8_0> qbs_iq4_nl;
+    static const unsigned qbs_segment = ggml_riscv_qbs_weight_segment_blocks();
+    static const ggml::cpu::repack::tensor_traits<ggml_riscv_qbs_q4_k_tag, 1, 4, GGML_TYPE_Q8_K> qbs_q4_K(qbs_segment);
+    static const ggml::cpu::repack::tensor_traits<ggml_riscv_qbs_q5_k_tag, 1, 4, GGML_TYPE_Q8_K> qbs_q5_K(qbs_segment);
+    static const ggml::cpu::repack::tensor_traits<ggml_riscv_qbs_q6_k_tag, 1, 4, GGML_TYPE_Q8_K> qbs_q6_K(qbs_segment);
+    static const ggml::cpu::repack::tensor_traits<ggml_riscv_qbs_q3_k_tag, 1, 4, GGML_TYPE_Q8_K> qbs_q3_K(qbs_segment);
+    static const ggml::cpu::repack::tensor_traits<ggml_riscv_qbs_q8_0_tag, 1, 4, GGML_TYPE_Q8_0> qbs_q8_0(qbs_segment);
+    static const ggml::cpu::repack::tensor_traits<ggml_riscv_qbs_q4_0_tag, 1, 4, GGML_TYPE_Q8_0> qbs_q4_0(qbs_segment);
+    static const ggml::cpu::repack::tensor_traits<ggml_riscv_qbs_q2_k_tag, 1, 4, GGML_TYPE_Q8_K> qbs_q2_K(qbs_segment);
+    static const ggml::cpu::repack::tensor_traits<ggml_riscv_qbs_iq4_nl_tag, 1, 4, GGML_TYPE_Q8_0> qbs_iq4_nl(qbs_segment);
+    static const ggml::cpu::repack::tensor_traits<ggml_riscv_qbs_q5_0_tag, 1, 4, GGML_TYPE_Q8_0> qbs_q5_0(qbs_segment);
 #endif
 
     // instance for Q4
@@ -5111,6 +5245,7 @@ static const ggml::cpu::tensor_traits * ggml_repack_get_optimal_repack_type(cons
     const bool qbs_dimensions_supported = qbs_n_dims == 2 ||
         (qbs_n_dims == 3 && cur->ne[1] % 4 == 0);
     const bool qbs_selected = qbs_dimensions_supported &&
+        (qbs_segment == 0 || ggml_nrows(cur) <= UINT32_MAX) &&
         ggml_riscv_qbs_supports_tensor(cur->type, cur->ne[0], cur->ne[1]);
     ggml_riscv_qbs_trace_tensor_decision(
         cur, cur->name, cur->type, qbs_n_dims, cur->ne[0], cur->ne[1],
@@ -5371,7 +5506,7 @@ class extra_buffer_type : ggml::cpu::extra_buffer_type {
                 op->src[0]->buffer &&
                 (ggml_n_dims(op->src[0]) == 2) &&
                 op->src[0]->buffer->buft == ggml_backend_cpu_repack_buffer_type() &&
-                ggml_repack_get_optimal_repack_type(op->src[0])
+                (op->src[0]->extra || ggml_repack_get_optimal_repack_type(op->src[0]))
                 ) {
             if (op->src[1]->buffer && !ggml_backend_buft_is_host(op->src[1]->buffer->buft)) {
                 return false;
@@ -5387,7 +5522,7 @@ class extra_buffer_type : ggml::cpu::extra_buffer_type {
                 && op->src[0]->buffer
                 && (ggml_n_dims(op->src[0]) == 3)
                 && op->src[0]->buffer->buft == ggml_backend_cpu_repack_buffer_type()
-                && ggml_repack_get_optimal_repack_type(op->src[0])
+                && (op->src[0]->extra || ggml_repack_get_optimal_repack_type(op->src[0]))
                 ) {
             if (op->src[1]->buffer && !ggml_backend_buft_is_host(op->src[1]->buffer->buft)) {
                 return false;

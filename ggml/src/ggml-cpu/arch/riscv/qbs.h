@@ -2,6 +2,10 @@
 
 #include "ggml.h"
 
+#if defined(GGML_USE_RISCV_QUANT_KV)
+#include "qbs/qbs.h"
+#endif
+
 #include <cstddef>
 #include <cstdint>
 
@@ -35,6 +39,20 @@ struct ggml_riscv_qbs_q5_0_tag {};
 struct ggml_riscv_qbs_iq4_nl_tag {};
 
 bool ggml_riscv_qbs_supports_tensor(ggml_type type, int64_t k_elements, int64_t output_rows);
+
+#if defined(GGML_USE_RISCV_QUANT_KV)
+// Native-only cached capabilities; null when disabled, emulated or unavailable.
+const qbs_device_t * ggml_riscv_qbs_direct_device();
+
+// Synchronous task under the QBS context mutex, without consuming its reservation.
+// Returns the task result unchanged, or -1 for null/nested/unavailable entry.
+// The executor is valid only on the task thread during this call. The task must
+// not reenter other QBS context APIs or acquire the caller's AKV context mutex.
+int ggml_riscv_qbs_direct_run(int (*task)(void *, qbs_command_executor_t), void * opaque);
+#endif
+
+// Read once when constructing a weight-layout trait; zero keeps global R4.
+unsigned ggml_riscv_qbs_weight_segment_blocks();
 
 void ggml_riscv_qbs_trace_tensor_decision(const void * tensor_identity,
                                           const char * tensor_name,
@@ -88,7 +106,8 @@ void ggml_riscv_qbs_trace_activation_lifetime(const void * op_identity,
                                               int64_t      output_rows,
                                               uint64_t     graph_epoch,
                                               bool         quantize_time_valid,
-                                              uint64_t     quantize_time_us);
+                                              uint64_t     quantize_time_us,
+                                              bool         prepared_cache_active = false);
 
 int ggml_riscv_qbs_repack_r4(ggml_type    type,
                              void *       dst,
@@ -96,7 +115,13 @@ int ggml_riscv_qbs_repack_r4(ggml_type    type,
                              const void * src,
                              size_t       src_size,
                              int64_t      output_rows,
-                             int64_t      k_blocks);
+                             int64_t      k_blocks,
+                             unsigned     segment_k_blocks = 0);
+
+void ggml_riscv_qbs_mul_mat_view(ggml_type weight_type, int k, float * dst, size_t dst_stride,
+                               const void * weights, const void * activations,
+                               int input_rows, int output_rows, int64_t storage_rows,
+                               int64_t row_start, unsigned segment_k_blocks, bool wide_m);
 
 void ggml_riscv_qbs_gemv(ggml_type    weight_type,
                          int          n,
