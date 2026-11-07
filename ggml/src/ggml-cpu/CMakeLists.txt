@@ -493,6 +493,15 @@ function(ggml_add_cpu_backend_variant_impl tag_name)
                 list(APPEND GGML_CPU_SOURCES
                     ${GGML_RISCV_AKV_RUNTIME_DIR}/src/akv_features.c)
             endif()
+            if (CMAKE_C_COMPILER_ID MATCHES "GNU|Clang")
+                set_property(SOURCE
+                    ${GGML_RISCV_AKV_RUNTIME_DIR}/src/akv_runtime.c
+                    ${GGML_RISCV_AKV_RUNTIME_DIR}/src/akv_native_riscv.c
+                    ${GGML_RISCV_AKV_RUNTIME_DIR}/src/akv_v2_native_riscv.c
+                    ${GGML_RISCV_AKV_RUNTIME_DIR}/src/akv_prefill_reference.c
+                    ${GGML_RISCV_AKV_RUNTIME_DIR}/src/akv_features.c
+                    APPEND PROPERTY COMPILE_OPTIONS -fno-fast-math -ffp-contract=off)
+            endif()
         endif()
         if (GGML_CPU_RISCV64_SPACEMIT)
             include(ggml-cpu/cmake/FindSMTIME.cmake)
