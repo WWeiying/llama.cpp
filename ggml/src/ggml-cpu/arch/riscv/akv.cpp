@@ -642,11 +642,31 @@ static akv_status_t emulate(void *,
 
 static akv_status_t execute(const akv_attention_plan_t * plan, akv_attention_v2_workspace_t * workspace) {
     if (plan->kernel_version == AKV_ATTENTION_KERNEL_VERSION_V2) {
-        return emulation_enabled() ? akv_attention_execute_v2(plan, emulate, nullptr)
-                                   : akv_attention_execute_v2_native(plan, workspace);
+        if (emulation_enabled()) {
+            return akv_attention_execute_v2(plan, emulate, nullptr);
+        }
+#if defined(AKV_NATIVE_AUTO_PAIR_POLICY) && AKV_NATIVE_AUTO_PAIR_POLICY
+        if (std::getenv("AKV_PAIR_HEADS") == nullptr) {
+            return akv_attention_execute_v2_native_auto(&device(), plan, workspace);
+        }
+#endif
+        return akv_attention_execute_v2_native(plan, workspace);
     }
     return emulation_enabled() ? akv_attention_execute(plan, emulate, nullptr) : akv_attention_execute_native(plan);
 }
+
+#ifdef GGML_AKV_PORTABLE_FEATURES
+static akv_status_t execute_features_native(const akv_attention_plan_t * plan,
+                                           akv_attention_v2_workspace_t * workspace,
+                                           const akv_attention_features_t * features) {
+#if defined(AKV_NATIVE_AUTO_PAIR_POLICY) && AKV_NATIVE_AUTO_PAIR_POLICY
+    if (std::getenv("AKV_PAIR_HEADS") == nullptr) {
+        return akv_attention_execute_v2_with_features_native_auto(&device(), plan, workspace, features);
+    }
+#endif
+    return akv_attention_execute_v2_with_features_native(plan, workspace, features);
+}
+#endif
 
 }  // namespace
 
@@ -807,7 +827,7 @@ bool ggml_riscv_akv_flash_attn(const ggml_compute_params * params, ggml_tensor *
             GGML_ASSERT(decode_features(dst, static_cast<uint32_t>(first_q_head), rows, active_kv, &features));
             execute_status = emulation_enabled()
                 ? akv_attention_execute_v2_with_features_reference(&plan, &features)
-                : akv_attention_execute_v2_with_features_native(&plan, &workspace, &features);
+                : execute_features_native(&plan, &workspace, &features);
         } else
 #endif
         {
