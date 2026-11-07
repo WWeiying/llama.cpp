@@ -7,6 +7,7 @@
 #include "ggml.h"
 #include "unary-ops.h"
 #include "vec.h"
+#include "arch/riscv/rms-norm.h"
 
 #ifdef GGML_USE_RISCV_AKV
 #include "arch/riscv/akv.h"
@@ -3823,6 +3824,8 @@ static void ggml_compute_forward_rms_norm_f32(
     memcpy(&eps, dst_rms_norm->op_params, sizeof(float));
     GGML_ASSERT(eps >= 0.0f);
 
+    auto rvv_rms = ggml_rvv_rms_begin(FUSE_OP == GGML_RMS_NORM_FUSE_OP_MUL, ne00, ith, nth);
+
     // TODO: optimize
     for (int64_t i03 = 0; i03 < ne03; i03++) {
         for (int64_t i02 = 0; i02 < ne02; i02++) {
@@ -3831,8 +3834,10 @@ static void ggml_compute_forward_rms_norm_f32(
 
                 ggml_float sum = 0.0;
                 // worth switching to explicit SIMD?
-                for (int64_t i00 = 0; i00 < ne00; i00++) {
-                    sum += (ggml_float)(x[i00] * x[i00]);
+                if (!ggml_rvv_rms_sum_row(&rvv_rms, x, (size_t)ne00, &sum)) {
+                    for (int64_t i00 = 0; i00 < ne00; i00++) {
+                        sum += (ggml_float)(x[i00] * x[i00]);
+                    }
                 }
 
                 const float mean  = sum/ne00;
@@ -3849,8 +3854,10 @@ static void ggml_compute_forward_rms_norm_f32(
                     const int64_t i13 = i03 % ne13;
                     const float * w = (float *) ((char *) src1->data + i11*nb11 + i12*nb12 + i13*nb13);
 
-                    for (int64_t i00 = 0; i00 < ne00; i00++) {
-                        y[i00] = x[i00] * scale * w[i00];
+                    if (!ggml_rvv_rms_output_row(&rvv_rms, y, x, w, scale, (size_t)ne00)) {
+                        for (int64_t i00 = 0; i00 < ne00; i00++) {
+                            y[i00] = x[i00] * scale * w[i00];
+                        }
                     }
                 } else {
                     memcpy(y, x, ne00 * sizeof(float));
@@ -3859,6 +3866,7 @@ static void ggml_compute_forward_rms_norm_f32(
             }
         }
     }
+    ggml_rvv_rms_finish(&rvv_rms);
 }
 
 void ggml_compute_forward_rms_norm(
