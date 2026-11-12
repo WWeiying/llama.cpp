@@ -3506,6 +3506,11 @@ void llama_context::opt_epoch(
 //
 
 llama_context_params llama_context_default_params() {
+#if defined(LLAMA_RISCV_ACCEL_DEFAULT_THREADS)
+    constexpr int default_threads = LLAMA_RISCV_ACCEL_DEFAULT_THREADS;
+#else
+    constexpr int default_threads = GGML_DEFAULT_N_THREADS;
+#endif
     llama_context_params result = {
         /*.n_ctx                       =*/ 512,
         /*.n_batch                     =*/ 2048,
@@ -3514,8 +3519,8 @@ llama_context_params llama_context_default_params() {
         /*.n_rs_seq                    =*/ 0,
         /*.n_outputs_max               =*/ 0,
         /*.n_outputs_max_per_seq       =*/ 1,
-        /*.n_threads                   =*/ GGML_DEFAULT_N_THREADS, // TODO: better default
-        /*.n_threads_batch             =*/ GGML_DEFAULT_N_THREADS,
+        /*.n_threads                   =*/ default_threads,
+        /*.n_threads_batch             =*/ default_threads,
         /*.ctx_type                    =*/ LLAMA_CONTEXT_TYPE_DEFAULT,
         /*.rope_scaling_type           =*/ LLAMA_ROPE_SCALING_TYPE_UNSPECIFIED,
         /*.pooling_type                =*/ LLAMA_POOLING_TYPE_UNSPECIFIED,

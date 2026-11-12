@@ -1,3 +1,9 @@
+set(GGML_AKV_RESIDENT_DEFAULT OFF)
+if (GGML_RISCV_AKV_PROVIDER_SOURCE)
+    set(GGML_AKV_RESIDENT_DEFAULT ON)
+endif()
+option(GGML_RISCV_AKV_RESIDENT "Trusted-provider resident Decode" ${GGML_AKV_RESIDENT_DEFAULT})
+option(GGML_RISCV_AKV_LINUX_PORTAL "Opt-in kernel-copy Resident Decode portal (cost unmeasured)" OFF)
 function(ggml_add_cpu_backend_features cpu_name arch)
     # The feature detection code is compiled as a separate target so that
     # it can be built without the architecture flags
@@ -437,6 +443,13 @@ function(ggml_add_cpu_backend_variant_impl tag_name)
         endif()
     elseif (GGML_SYSTEM_ARCH STREQUAL "riscv64")
         message(STATUS "riscv64 detected")
+        if (GGML_RISCV_QBS OR GGML_RISCV_AKV)
+            target_compile_definitions(${GGML_CPU_NAME} PRIVATE
+                GGML_RISCV_ACCEL_AUTO=$<BOOL:${GGML_RISCV_ACCEL_AUTO}>)
+            if (GGML_RISCV_ACCEL_AUTO AND CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
+                target_compile_options(${GGML_CPU_NAME} PRIVATE -fno-fast-math -ffp-contract=off)
+            endif()
+        endif()
         list(APPEND GGML_CPU_SOURCES
             ggml-cpu/arch/riscv/quants.c
             ggml-cpu/arch/riscv/repack.cpp
@@ -458,6 +471,19 @@ function(ggml_add_cpu_backend_variant_impl tag_name)
             target_compile_definitions(${GGML_CPU_NAME} PRIVATE GGML_USE_RISCV_QBS)
             target_include_directories(${GGML_CPU_NAME} PRIVATE
                 ${GGML_RISCV_QBS_RUNTIME_DIR}/include)
+            option(GGML_RISCV_QBS_M4_PREFLIGHT "Retained-maxima preparation for eligible cached K1536 M4 calls" OFF)
+            if (GGML_RISCV_QBS_M4_PREFLIGHT)
+                set(GGML_RISCV_QBS_M4_PREFLIGHT_DIR
+                    "${GGML_RISCV_QBS_RUNTIME_DIR}/experimental/m4_preflight" CACHE PATH
+                    "Reviewed SDK retained-maxima helper directory")
+                if (NOT EXISTS "${GGML_RISCV_QBS_M4_PREFLIGHT_DIR}/m4_preflight.h")
+                    message(FATAL_ERROR "GGML_RISCV_QBS_M4_PREFLIGHT_DIR must contain m4_preflight.h")
+                endif()
+                target_compile_definitions(${GGML_CPU_NAME} PRIVATE GGML_USE_RISCV_QBS_M4_PREFLIGHT)
+                target_include_directories(${GGML_CPU_NAME} PRIVATE
+                    "${GGML_RISCV_QBS_M4_PREFLIGHT_DIR}"
+                    "${CMAKE_CURRENT_SOURCE_DIR}/ggml-cpu/arch/riscv")
+            endif()
             list(APPEND GGML_CPU_SOURCES
                 ggml-cpu/arch/riscv/qbs.cpp
                 ggml-cpu/arch/riscv/qbs.h
@@ -466,6 +492,60 @@ function(ggml_add_cpu_backend_variant_impl tag_name)
                 )
         endif()
         if (GGML_RISCV_AKV)
+            option(GGML_RISCV_AKV_QUANT_KV "Experimental QBS DIRECT quantized Decode Attention" OFF)
+            if (GGML_RISCV_AKV_QUANT_KV)
+                if (NOT GGML_RISCV_QBS)
+                    message(FATAL_ERROR "GGML_RISCV_AKV_QUANT_KV requires GGML_RISCV_QBS")
+                endif()
+                set(GGML_QUANT_KV_DIR "${GGML_RISCV_AKV_RUNTIME_DIR}/experimental/quantized_kv")
+                if (NOT EXISTS "${GGML_QUANT_KV_DIR}/ggml_entry_strided.h")
+                    message(FATAL_ERROR "GGML_RISCV_AKV_QUANT_KV requires the experimental quantized_kv runtime")
+                endif()
+                target_compile_definitions(${GGML_CPU_NAME} PRIVATE GGML_USE_RISCV_QUANT_KV)
+                target_include_directories(${GGML_CPU_NAME} PRIVATE "${GGML_QUANT_KV_DIR}")
+                list(APPEND GGML_CPU_SOURCES
+                    ggml-cpu/arch/riscv/quant-kv.cpp
+                    ggml-cpu/arch/riscv/quant-kv.h
+                    ${GGML_QUANT_KV_DIR}/runtime.c
+                    ${GGML_QUANT_KV_DIR}/runtime_strided.c)
+                option(GGML_RISCV_AKV_QUANT_PREFILL "Experimental grouped quantized Prefill Attention" OFF)
+                option(GGML_RISCV_AKV_REGISTER_PV "Opt-in register-resident quantized Decode PV" OFF)
+                if (GGML_RISCV_AKV_REGISTER_PV)
+                    if (NOT EXISTS "${GGML_QUANT_KV_DIR}/register_pv/entry.c")
+                        message(FATAL_ERROR "Register-PV requires the reviewed shared runtime")
+                    endif()
+                    get_filename_component(GGML_REGISTER_PV_ROOT "${GGML_QUANT_KV_DIR}/../../../.." ABSOLUTE)
+                    target_include_directories(${GGML_CPU_NAME} PRIVATE "${GGML_REGISTER_PV_ROOT}")
+                    target_compile_definitions(${GGML_CPU_NAME} PRIVATE GGML_USE_RISCV_REGISTER_PV)
+                    list(APPEND GGML_CPU_SOURCES "${GGML_QUANT_KV_DIR}/register_pv/entry.c")
+                    if (CMAKE_C_COMPILER_ID MATCHES "GNU|Clang")
+                        set_property(SOURCE "${GGML_QUANT_KV_DIR}/register_pv/entry.c"
+                            APPEND PROPERTY COMPILE_OPTIONS -fno-fast-math -ffp-contract=fast)
+                    endif()
+                endif()
+                if (GGML_RISCV_AKV_QUANT_PREFILL)
+                    set(GGML_RISCV_AKV_PREFILL_DIR "${GGML_QUANT_KV_DIR}/prefill" CACHE PATH "Reviewed Prefill C entry source directory")
+                    if (NOT GGML_RISCV_AKV_PREFILL_DIR)
+                        set(GGML_RISCV_AKV_PREFILL_DIR "${GGML_QUANT_KV_DIR}/prefill")
+                    endif()
+                    if (NOT EXISTS "${GGML_RISCV_AKV_PREFILL_DIR}/ggml_entry.c")
+                        message(FATAL_ERROR "GGML_RISCV_AKV_PREFILL_DIR must contain the reviewed Prefill entry")
+                    endif()
+                    get_filename_component(GGML_PREFILL_PARENT "${GGML_RISCV_AKV_PREFILL_DIR}/.." ABSOLUTE)
+                    get_filename_component(GGML_PREFILL_ROOT "${GGML_QUANT_KV_DIR}/../../../.." ABSOLUTE)
+                    target_include_directories(${GGML_CPU_NAME} PRIVATE "${GGML_PREFILL_PARENT}" "${GGML_PREFILL_ROOT}")
+                    target_compile_definitions(${GGML_CPU_NAME} PRIVATE GGML_USE_RISCV_QUANT_PREFILL)
+                    list(APPEND GGML_CPU_SOURCES "${GGML_RISCV_AKV_PREFILL_DIR}/ggml_entry.c")
+                    if (CMAKE_C_COMPILER_ID MATCHES "GNU|Clang")
+                        set_property(SOURCE "${GGML_RISCV_AKV_PREFILL_DIR}/ggml_entry.c"
+                            APPEND PROPERTY COMPILE_OPTIONS -fno-fast-math -ffp-contract=fast)
+                    endif()
+                endif()
+                if (CMAKE_C_COMPILER_ID MATCHES "GNU|Clang")
+                    set_property(SOURCE ggml-cpu/arch/riscv/quant-kv.cpp ${GGML_QUANT_KV_DIR}/runtime.c ${GGML_QUANT_KV_DIR}/runtime_strided.c
+                        APPEND PROPERTY COMPILE_OPTIONS -fno-fast-math -ffp-contract=fast)
+                endif()
+            endif()
             if (NOT GGML_RVV)
                 message(FATAL_ERROR "GGML_RISCV_AKV requires GGML_RVV")
             endif()
@@ -476,6 +556,106 @@ function(ggml_add_cpu_backend_variant_impl tag_name)
                 message(FATAL_ERROR "GGML_RISCV_AKV_RUNTIME_DIR must contain include/akv/akv.h")
             endif()
             enable_language(ASM)
+            if (GGML_RISCV_AKV_LINUX_PORTAL)
+                if (NOT CMAKE_SYSTEM_NAME STREQUAL "Linux" OR NOT CMAKE_SIZEOF_VOID_P EQUAL 8)
+                    message(FATAL_ERROR "GGML_RISCV_AKV_LINUX_PORTAL requires RV64 Linux with the lp64d user ABI")
+                endif()
+                set(GGML_RISCV_AKV_LINUX_PORTAL_DIR
+                    "${GGML_RISCV_AKV_RUNTIME_DIR}/../llama/platform/linux" CACHE PATH
+                    "Archived Ara SDK software/llama/platform/linux source directory")
+                get_filename_component(GGML_AKV_LINUX_DIR "${GGML_RISCV_AKV_LINUX_PORTAL_DIR}" ABSOLUTE)
+                foreach(source client.h ara_resident_uapi.h job_layout.h client_v2.c client_rv64.S)
+                    if (NOT EXISTS "${GGML_AKV_LINUX_DIR}/${source}")
+                        message(FATAL_ERROR "GGML_RISCV_AKV_LINUX_PORTAL_DIR must contain ${source}")
+                    endif()
+                endforeach()
+                target_compile_definitions(${GGML_CPU_NAME} PRIVATE GGML_USE_RISCV_AKV_LINUX_PORTAL)
+                target_include_directories(${GGML_CPU_NAME} PRIVATE "${GGML_AKV_LINUX_DIR}")
+                list(APPEND GGML_CPU_SOURCES "${GGML_AKV_LINUX_DIR}/client_v2.c" "${GGML_AKV_LINUX_DIR}/client_rv64.S")
+                set_property(SOURCE "${GGML_AKV_LINUX_DIR}/client_rv64.S" APPEND PROPERTY
+                    COMPILE_OPTIONS -march=rv64gcv -mabi=lp64d -fno-lto)
+                set_property(SOURCE "${GGML_AKV_LINUX_DIR}/client_v2.c" APPEND PROPERTY
+                    COMPILE_OPTIONS -march=rv64gc -mabi=lp64d -ffreestanding -fno-builtin -fno-lto
+                    -fno-fast-math -ffp-contract=off)
+                if (CMAKE_C_COMPILER_ID STREQUAL "GNU" AND CMAKE_CXX_COMPILER_ID STREQUAL "GNU")
+                    set_property(SOURCE "${GGML_AKV_LINUX_DIR}/client_v2.c" ggml-cpu/arch/riscv/akv.cpp
+                        APPEND PROPERTY COMPILE_OPTIONS -fno-tree-vectorize -fno-tree-slp-vectorize)
+                elseif (CMAKE_C_COMPILER_ID MATCHES "Clang" AND CMAKE_CXX_COMPILER_ID MATCHES "Clang")
+                    set_property(SOURCE "${GGML_AKV_LINUX_DIR}/client_v2.c" ggml-cpu/arch/riscv/akv.cpp
+                        APPEND PROPERTY COMPILE_OPTIONS -fno-vectorize -fno-slp-vectorize)
+                else()
+                    message(FATAL_ERROR "Linux portal guard requires reviewed scalar compiler flags")
+                endif()
+                set_property(SOURCE ggml-cpu/arch/riscv/akv.cpp APPEND PROPERTY
+                    COMPILE_OPTIONS -fno-fast-math -ffp-contract=off -fno-lto)
+            endif()
+            if (GGML_RISCV_AKV_RESIDENT)
+                if (GGML_RISCV_AKV_PROVIDER_SOURCE)
+                    if (NOT EXISTS "${GGML_RISCV_AKV_PROVIDER_SOURCE}")
+                        message(FATAL_ERROR "GGML_RISCV_AKV_PROVIDER_SOURCE does not exist")
+                    endif()
+                    if (CMAKE_VERSION VERSION_LESS 3.21)
+                        message(FATAL_ERROR "The trusted provider link requires CMake 3.21 or newer")
+                    endif()
+                    set(GGML_AKV_PROVIDER_OBJ "${GGML_CPU_NAME}-akv-provider")
+                    set(GGML_AKV_PROVIDER_LINK "${GGML_CPU_NAME}-akv-provider-link")
+                    add_library(${GGML_AKV_PROVIDER_OBJ} OBJECT "${GGML_RISCV_AKV_PROVIDER_SOURCE}")
+                    set_target_properties(${GGML_AKV_PROVIDER_OBJ} PROPERTIES POSITION_INDEPENDENT_CODE ON)
+                    target_include_directories(${GGML_AKV_PROVIDER_OBJ} PRIVATE
+                        ${GGML_RISCV_AKV_RUNTIME_DIR}/include
+                        ${GGML_RISCV_AKV_RUNTIME_DIR}/experimental
+                        ${CMAKE_CURRENT_SOURCE_DIR}/ggml-cpu/arch/riscv)
+                    target_compile_definitions(${GGML_AKV_PROVIDER_OBJ} PRIVATE
+                        GGML_AKV_RESIDENT=1 AKV_EXPERIMENTAL_RESIDENT_ATTENTION=1)
+                    if (CMAKE_C_COMPILER_ID STREQUAL "GNU")
+                        target_compile_options(${GGML_AKV_PROVIDER_OBJ} PRIVATE
+                            -fno-tree-vectorize -fno-tree-slp-vectorize -ffreestanding -fno-builtin
+                            -fno-fast-math -ffp-contract=off)
+                    elseif (CMAKE_C_COMPILER_ID MATCHES "Clang")
+                        target_compile_options(${GGML_AKV_PROVIDER_OBJ} PRIVATE
+                            -fno-vectorize -fno-slp-vectorize -ffreestanding -fno-builtin
+                            -fno-fast-math -ffp-contract=off)
+                    else()
+                        message(FATAL_ERROR "The trusted provider requires reviewed scalar compiler flags")
+                    endif()
+                    add_library(${GGML_AKV_PROVIDER_LINK} INTERFACE)
+                    target_link_libraries(${GGML_AKV_PROVIDER_LINK} INTERFACE
+                        ${GGML_AKV_PROVIDER_OBJ} "$<TARGET_OBJECTS:${GGML_AKV_PROVIDER_OBJ}>")
+                    target_link_libraries(${GGML_CPU_NAME} PRIVATE "$<BUILD_INTERFACE:${GGML_AKV_PROVIDER_LINK}>")
+                endif()
+                if (NOT EXISTS "${GGML_RISCV_AKV_RUNTIME_DIR}/experimental/resident_attention/executor.h")
+                    message(FATAL_ERROR "Resident opt-in requires the reviewed experimental SDK")
+                endif()
+                target_compile_definitions(${GGML_CPU_NAME} PRIVATE
+                    GGML_AKV_RESIDENT=1 AKV_EXPERIMENTAL_RESIDENT_ATTENTION=1
+                    AKV_EXPERIMENTAL_RESIDENT_FEATURES_V2=0 AKV_REFILL_OVERLAP=0)
+                target_include_directories(${GGML_CPU_NAME} PRIVATE
+                    ${GGML_RISCV_AKV_RUNTIME_DIR}/experimental
+                    ${CMAKE_CURRENT_SOURCE_DIR}/ggml-cpu/arch/riscv)
+                list(APPEND GGML_CPU_SOURCES
+                    ggml-cpu/arch/riscv/platform.c
+                    ggml-cpu/arch/riscv/read_state.S
+                    ggml-cpu/arch/riscv/entry.c
+                    ${GGML_RISCV_AKV_RUNTIME_DIR}/experimental/resident_attention/qk.S
+                    ${GGML_RISCV_AKV_RUNTIME_DIR}/experimental/resident_attention/pv.S)
+                if (CMAKE_C_COMPILER_ID STREQUAL "GNU")
+                    set_property(SOURCE ggml-cpu/arch/riscv/platform.c ggml-cpu/arch/riscv/entry.c
+                        APPEND PROPERTY COMPILE_OPTIONS
+                        -fno-tree-vectorize -fno-tree-slp-vectorize -ffreestanding -fno-builtin)
+                    set_property(SOURCE ggml-cpu/arch/riscv/akv.cpp
+                        APPEND PROPERTY COMPILE_OPTIONS
+                        -fno-tree-vectorize -fno-tree-slp-vectorize -fno-fast-math -ffp-contract=off)
+                elseif (CMAKE_C_COMPILER_ID MATCHES "Clang")
+                    set_property(SOURCE ggml-cpu/arch/riscv/platform.c ggml-cpu/arch/riscv/entry.c
+                        APPEND PROPERTY COMPILE_OPTIONS
+                        -fno-vectorize -fno-slp-vectorize -ffreestanding -fno-builtin)
+                    set_property(SOURCE ggml-cpu/arch/riscv/akv.cpp
+                        APPEND PROPERTY COMPILE_OPTIONS
+                        -fno-vectorize -fno-slp-vectorize -fno-fast-math -ffp-contract=off)
+                else()
+                    message(FATAL_ERROR "Resident guard requires reviewed scalar compiler flags")
+                endif()
+            endif()
             target_compile_definitions(${GGML_CPU_NAME} PRIVATE GGML_USE_RISCV_AKV)
             target_include_directories(${GGML_CPU_NAME} PRIVATE
                 ${GGML_RISCV_AKV_RUNTIME_DIR}/include)

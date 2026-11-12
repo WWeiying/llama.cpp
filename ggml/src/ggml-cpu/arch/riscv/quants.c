@@ -1,3 +1,6 @@
+#if defined(__riscv_v)
+#include "q8_K-decode-sums.h"
+#endif
 #define GGML_COMMON_IMPL_C
 #include "ggml-common.h"
 #include "ggml-quants.h"
@@ -170,7 +173,6 @@ void quantize_row_q8_K(const float * GGML_RESTRICT x, void * GGML_RESTRICT y, in
         // 2. Quantize and Calculate Sums
         offset = 0;
         rem = QK_K;
-        vint16m1_t v_zero_sum = __riscv_vmv_v_x_i16m1(0, 1);
 
         while (rem > 0) {
             size_t vl = __riscv_vsetvl_e32m8(rem);
@@ -184,28 +186,7 @@ void quantize_row_q8_K(const float * GGML_RESTRICT x, void * GGML_RESTRICT y, in
 
             __riscv_vse8_v_i8m2(y_block->qs + offset, v_q, vl);
 
-            // first iteration clear
-
-            int sum_idx;
-            vint8m1_t chunk_m1;
-            vint16m1_t v_sum;
-            sum_idx = offset / 16;
-            chunk_m1 = __riscv_vget_v_i8m2_i8m1(v_q, 0);
-            v_sum = __riscv_vwredsum_vs_i8m1_i16m1(chunk_m1, v_zero_sum, 16);
-            y_block->bsums[sum_idx] = (int16_t)__riscv_vmv_x_s_i16m1_i16(v_sum);
-
-            // remaining iterations
-            vint8m2_t slid_q = v_q;
-            for (size_t k = 16; k < vl; k += 16) {
-                slid_q = __riscv_vslidedown_vx_i8m2(slid_q, 16, vl);
-
-                sum_idx = (offset + k) / 16;
-                chunk_m1 = __riscv_vget_v_i8m2_i8m1(slid_q, 0);
-
-                v_sum = __riscv_vwredsum_vs_i8m1_i16m1(chunk_m1, v_zero_sum, 16);
-                y_block->bsums[sum_idx] =(int16_t)__riscv_vmv_x_s_i16m1_i16(v_sum);
-            }
-
+            ggml_riscv_q8_K_bsums(v_q, vl, y_block->bsums + offset/16);
             rem -= vl;
             offset += vl;
         }

@@ -55,6 +55,13 @@ target_compile_definitions(llama PRIVATE
     LLAMA_COMMIT="${LLAMA_BUILD_COMMIT}"
 )
 
+if (GGML_RISCV_ACCEL_AUTO AND (GGML_RISCV_QBS OR GGML_RISCV_AKV))
+    target_compile_definitions(llama PRIVATE LLAMA_RISCV_ACCEL_DEFAULT_THREADS=1)
+    if (CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
+        target_compile_options(llama PRIVATE -fno-fast-math -ffp-contract=off)
+    endif()
+endif()
+
 target_include_directories(llama PRIVATE .)
 target_include_directories(llama PUBLIC ../include)
 target_compile_features   (llama PRIVATE cxx_std_17) # don't bump

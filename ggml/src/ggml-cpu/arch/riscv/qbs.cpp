@@ -1,9 +1,11 @@
 #include "qbs.h"
+#include "accel-options.h"
 
 #include "ggml-cpu-impl.h"
 #include "ggml-quants.h"
 #include "qbs/qbs.h"
 #include "quants.h"
+#include "q8_K-m8.h"
 
 #include <algorithm>
 #include <array>
@@ -110,6 +112,7 @@ struct qbs_activation_trace_state {
     std::deque<qbs_activation_trace_record> records;
     uint64_t                                sequence               = 0;
     uint64_t                                quantizations           = 0;
+    bool                                    prepared_cache_active   = false;
     uint64_t                                exact_reuse_candidates  = 0;
     uint64_t                                quantized_bytes          = 0;
     uint64_t                                reusable_quantized_bytes = 0;
@@ -157,19 +160,27 @@ static void print_activation_trace_summary() {
     auto & state = activation_trace_state();
     std::lock_guard<std::mutex> lock(state.mutex);
     std::fprintf(stderr,
-                 "GGML_RISCV_QBS_LIFETIME_SUMMARY quantizations=%llu "
-                 "exact_reuse_candidates=%llu quantized_bytes=%llu "
-                 "reusable_quantized_bytes=%llu quantizations_with_time=%llu "
-                 "quantize_time_us=%llu reusable_quantize_time_us=%llu "
+                 "%s %s=%llu "
+                 "%s=%llu %s=%llu "
+                 "%s=%llu %s=%llu "
+                 "%s=%llu %s=%llu "
                  "graph_epochs=%zu cross_op_fill=%llu cross_op_reuse=%llu "
                  "cross_op_release=%llu cross_op_quantization_skips=%llu "
                  "cross_op_activation_bytes_saved=%llu\n",
+                 state.prepared_cache_active ? "GGML_RISCV_QBS_LIFETIME_SUMMARY_V2" : "GGML_RISCV_QBS_LIFETIME_SUMMARY",
+                 state.prepared_cache_active ? "prepared_buffer_invocations" : "quantizations",
                  static_cast<unsigned long long>(state.quantizations),
+                 state.prepared_cache_active ? "exact_duplicate_prepared_buffers" : "exact_reuse_candidates",
                  static_cast<unsigned long long>(state.exact_reuse_candidates),
+                 state.prepared_cache_active ? "prepared_bytes" : "quantized_bytes",
                  static_cast<unsigned long long>(state.quantized_bytes),
+                 state.prepared_cache_active ? "duplicate_prepared_bytes" : "reusable_quantized_bytes",
                  static_cast<unsigned long long>(state.reusable_quantized_bytes),
+                 state.prepared_cache_active ? "prepared_invocations_with_time" : "quantizations_with_time",
                  static_cast<unsigned long long>(state.quantizations_with_time),
+                 state.prepared_cache_active ? "preparation_time_us" : "quantize_time_us",
                  static_cast<unsigned long long>(state.quantize_time_us),
+                 state.prepared_cache_active ? "duplicate_preparation_time_us" : "reusable_quantize_time_us",
                  static_cast<unsigned long long>(state.reusable_quantize_time_us),
                  state.graph_epochs.size(),
                  static_cast<unsigned long long>(cross_op_fill_calls.load(std::memory_order_relaxed)),
@@ -222,7 +233,7 @@ static qbs_profile profile_for_type(ggml_type type) {
 }
 
 static bool env_true(const char * name) {
-    const char * value = std::getenv(name);
+    const char * value = ggml_riscv_accel_option(name);
     if (value == nullptr) {
         return false;
     }
@@ -242,10 +253,6 @@ static bool qbs_runtime_enabled() {
 static bool qbs_activation_context_enabled() {
     const char * value = std::getenv("GGML_RISCV_QBS_ACTIVATION_CONTEXT");
     return value == nullptr || env_true("GGML_RISCV_QBS_ACTIVATION_CONTEXT");
-}
-
-static bool qbs_wide_m_enabled() {
-    return env_true("GGML_RISCV_QBS_WIDE_M");
 }
 
 static bool format_name_equal(const char * token, size_t token_size, const char * expected) {
@@ -475,8 +482,10 @@ static void record_command(ggml_type                      type,
                            bool                           emulated,
                            bool                           segmented,
                            uint64_t                       graph_epoch,
-                           uint64_t                       activation_sequence) {
-    if (!env_true("GGML_RISCV_QBS_TRACE")) {
+                           uint64_t                       activation_sequence,
+                           bool                           trace_commands,
+                           bool                           trace_lifetime) {
+    if (!trace_commands) {
         return;
     }
     ensure_trace_registered();
@@ -507,7 +516,7 @@ static void record_command(ggml_type                      type,
             break;
     }
 
-    if (ggml_riscv_qbs_trace_activation_lifetime_enabled()) {
+    if (trace_lifetime) {
         const uint64_t command_sequence = lifetime_command_sequence.fetch_add(1, std::memory_order_relaxed) + 1;
         std::fprintf(stderr,
                      "GGML_RISCV_QBS_COMMAND seq=%llu graph_epoch=%llu activation_seq=%llu linked=%d "
@@ -760,8 +769,15 @@ static void emulate_qbs(ggml_type    weight_type,
 struct qbs_execution_context {
     ggml_type weight_type;
     bool      emulated;
+    bool      trace_commands;
+    bool      trace_lifetime;
     uint64_t  graph_epoch;
     uint64_t  activation_sequence;
+
+    qbs_execution_context(ggml_type type, bool emulate, uint64_t epoch, uint64_t sequence) :
+        weight_type(type), emulated(emulate), trace_commands(env_true("GGML_RISCV_QBS_TRACE")),
+        trace_lifetime(trace_commands && ggml_riscv_qbs_trace_activation_lifetime_enabled()),
+        graph_epoch(epoch), activation_sequence(sequence) {}
 };
 
 enum class qbs_cross_op_scope : uint8_t {
@@ -805,6 +821,41 @@ static qbs_cross_op_state & cross_op_state() {
     static auto * state = new qbs_cross_op_state;
     return *state;
 }
+
+#if defined(GGML_USE_RISCV_QUANT_KV)
+static thread_local bool direct_task_active = false;
+
+struct qbs_direct_task_scope {
+    const bool previous;
+
+    qbs_direct_task_scope() : previous(direct_task_active) { direct_task_active = true; }
+    ~qbs_direct_task_scope() { direct_task_active = previous; }
+    qbs_direct_task_scope(const qbs_direct_task_scope &) = delete;
+    qbs_direct_task_scope & operator=(const qbs_direct_task_scope &) = delete;
+};
+
+static qbs_status_t execute_direct_command(void *, const qbs_descriptor_t * descriptor,
+                                            unsigned m, const void * activations, float * output,
+                                            size_t output_stride, unsigned n, int segmented) {
+    if (!direct_task_active || descriptor == nullptr || segmented != 0) {
+        return QBS_STATUS_BAD_ARGUMENT;
+    }
+    const qbs_descriptor_fields_t fields = qbs_unpack_descriptor_header(descriptor->header);
+    if (fields.activation_access != QBS_ACTIVATION_ACCESS_DIRECT) {
+        return QBS_STATUS_BAD_ARGUMENT;
+    }
+    if (fields.weight_layout != QBS_WEIGHT_LAYOUT_ROW_MAJOR ||
+        fields.activation_layout != QBS_ACTIVATION_LAYOUT_ROW_MAJOR) {
+        return QBS_STATUS_LAYOUT;
+    }
+    if ((fields.weight_profile != QBS_WEIGHT_PROFILE_Q4_0 &&
+         fields.weight_profile != QBS_WEIGHT_PROFILE_Q8_0_WEIGHT) ||
+        fields.activation_profile != QBS_ACTIVATION_PROFILE_Q8_0) {
+        return QBS_STATUS_PROFILE;
+    }
+    return qbs_native_execute_command(nullptr, descriptor, m, activations, output, output_stride, n, segmented);
+}
+#endif
 
 static bool same_cross_op_identity(const qbs_cross_op_identity & lhs, const qbs_cross_op_identity & rhs) {
     return lhs.graph_epoch == rhs.graph_epoch && lhs.source_tensor == rhs.source_tensor &&
@@ -855,7 +906,11 @@ static bool context_plan_supported(ggml_type weight_type, int64_t k_elements, in
         static_cast<uint32_t>(k_elements),
     };
     qbs_plan_t plan{};
-    return qbs_plan_create(&device(), &problem, &plan) == QBS_STATUS_OK &&
+    const unsigned segment = ggml_riscv_qbs_weight_segment_blocks();
+    const qbs_status_t status = segment != 0
+        ? qbs_plan_create_segmented_r4(&device(), &problem, segment, &plan)
+        : qbs_plan_create(&device(), &problem, &plan);
+    return status == QBS_STATUS_OK &&
            qbs_plan_supports_activation_context(&plan);
 }
 
@@ -888,6 +943,40 @@ static bool context_identity_for_node(const ggml_tensor * node,
     return true;
 }
 
+static bool node_may_modify_activation(const ggml_tensor * node, const qbs_cross_op_identity & current) {
+    switch (node->op) {
+        case GGML_OP_NONE:
+        case GGML_OP_RESHAPE:
+        case GGML_OP_VIEW:
+        case GGML_OP_PERMUTE:
+        case GGML_OP_TRANSPOSE:
+            return false;
+        case GGML_OP_MAP_CUSTOM1:
+        case GGML_OP_MAP_CUSTOM2:
+        case GGML_OP_MAP_CUSTOM3:
+        case GGML_OP_CUSTOM:
+        case GGML_OP_OPT_STEP_ADAMW:
+        case GGML_OP_OPT_STEP_SGD:
+            // These operations can write outside the result tensor.
+            return true;
+        default:
+            break;
+    }
+    if (node->data == nullptr || current.source_data == nullptr || current.source_tensor == nullptr) {
+        return true;
+    }
+    const size_t write_bytes = ggml_nbytes(node);
+    const size_t source_bytes = ggml_nbytes(current.source_tensor);
+    if (write_bytes == 0 || source_bytes == 0) {
+        return false;
+    }
+    const uintptr_t write_begin = reinterpret_cast<uintptr_t>(node->data);
+    const uintptr_t source_begin = reinterpret_cast<uintptr_t>(current.source_data);
+    // Compare distances so an end-address addition cannot wrap.
+    return write_begin >= source_begin ? write_begin - source_begin < source_bytes :
+                                        source_begin - write_begin < write_bytes;
+}
+
 static bool next_context_consumer_matches(const ggml_compute_params * params,
                                           const qbs_cross_op_identity & current) {
     if (params->cgraph == nullptr || params->node_index < 0) {
@@ -895,8 +984,34 @@ static bool next_context_consumer_matches(const ggml_compute_params * params,
     }
     const int node_count = ggml_graph_n_nodes(params->cgraph);
     for (int node_index = params->node_index + 1; node_index < node_count; ++node_index) {
+        const ggml_tensor * next_node = ggml_graph_node(params->cgraph, node_index);
+        if (node_may_modify_activation(next_node, current)) {
+            if (ggml_riscv_qbs_trace_activation_lifetime_enabled()) {
+                std::fprintf(stderr, "GGML_RISCV_QBS_CONTEXT_BARRIER graph_epoch=%llu op=%s reason=may_modify_activation\n",
+                             static_cast<unsigned long long>(current.graph_epoch), ggml_op_name(next_node->op));
+            }
+            return false;
+        }
+        // Expert kernels may acquire the same context without cross-op reuse.
+        if (next_node->op == GGML_OP_MUL_MAT_ID) {
+            return false;
+        }
         qbs_cross_op_identity next{};
-        if (!context_identity_for_node(ggml_graph_node(params->cgraph, node_index), params->graph_epoch, &next)) {
+        if (!context_identity_for_node(next_node, params->graph_epoch, &next)) {
+            // Quantized matrices may acquire a context even for a tail.
+            // Ordinary float matrices do not enter the QBS block interface.
+            // The input-write check above remains mandatory before this skip.
+            if (next_node->op == GGML_OP_MUL_MAT) {
+                const ggml_tensor * weights = next_node->src[0];
+                const ggml_tensor * activation = next_node->src[1];
+                if (weights != nullptr && activation != nullptr &&
+                    (weights->type == GGML_TYPE_F32 || weights->type == GGML_TYPE_F16) &&
+                    activation->type == GGML_TYPE_F32 &&
+                    profile_for_type(weights->type).weight == QBS_WEIGHT_PROFILE_INVALID) {
+                    continue;
+                }
+                return false;
+            }
             continue;
         }
         return same_cross_op_identity(current, next);
@@ -965,7 +1080,8 @@ static qbs_status_t execute_command(void *                      opaque,
     }
     if (status == QBS_STATUS_OK) {
         record_command(context->weight_type, m, n, fields, block_elements, context->emulated, segmented,
-                       context->graph_epoch, context->activation_sequence);
+                       context->graph_epoch, context->activation_sequence,
+                       context->trace_commands, context->trace_lifetime);
     }
     return status;
 }
@@ -1001,6 +1117,12 @@ static qbs_status_t execute_plan(const qbs_plan_t &          plan,
             return QBS_STATUS_CONTEXT_TOKEN;
         }
     } else {
+        if (state.reserved && ggml_riscv_qbs_trace_activation_lifetime_enabled()) {
+            std::fprintf(stderr, "GGML_RISCV_QBS_CONTEXT_WAIT graph_epoch=%llu owner_epoch=%llu generation=%u m=%u n=%u k_blocks=%u\n",
+                         static_cast<unsigned long long>(context->graph_epoch),
+                         static_cast<unsigned long long>(state.owner.graph_epoch), state.generation,
+                         plan.problem.m, plan.problem.n, plan.k_blocks);
+        }
         state.available.wait(lock, [&] { return !state.reserved; });
     }
 
@@ -1060,11 +1182,37 @@ static qbs_status_t execute_plan(const qbs_plan_t &          plan,
 
 }  // namespace
 
+#if defined(GGML_USE_RISCV_QUANT_KV)
+const qbs_device_t * ggml_riscv_qbs_direct_device() {
+    if (!qbs_runtime_enabled() || qbs_emulation_enabled()) {
+        return nullptr;
+    }
+    // Keep reference capabilities cached by device() out of this native bridge.
+    static const qbs_device_t native_device = []() {
+        qbs_device_t value{};
+        return qbs_device_query(qbs_native_info, nullptr, &value) == QBS_STATUS_OK ? value : qbs_device_t{};
+    }();
+    return native_device.capabilities.valid ? &native_device : nullptr;
+}
+
+int ggml_riscv_qbs_direct_run(int (*task)(void *, qbs_command_executor_t), void * opaque) {
+    if (task == nullptr || direct_task_active || ggml_riscv_qbs_direct_device() == nullptr) {
+        return -1;
+    }
+    // DIRECT preserves persistent AQ: exclude executing context operations, but
+    // never wait for a reservation whose consumer may be later in this graph.
+    std::lock_guard<std::mutex> lock(cross_op_state().mutex);
+    qbs_direct_task_scope scope;
+    return task(opaque, execute_direct_command);
+}
+#endif
+
 bool ggml_riscv_qbs_plan_activations(ggml_type                          weight_type,
                                      int64_t                            input_rows,
                                      int64_t                            output_rows,
                                      int64_t                            k_elements,
-                                     ggml_riscv_qbs_activation_plan * plan) {
+                                     ggml_riscv_qbs_activation_plan * plan,
+                                     bool allow_auto_m8) {
     if (plan == nullptr) {
         return false;
     }
@@ -1088,7 +1236,16 @@ bool ggml_riscv_qbs_plan_activations(ggml_type                          weight_t
         return false;
     }
 
-    const qbs_activation_storage_t storage = qbs_wide_m_enabled()
+    const char *wide_option = std::getenv("GGML_RISCV_QBS_WIDE_M");
+    bool cooperative = false;
+#ifdef QBS_FEATURE_Q4_K_COOPERATIVE
+    cooperative = device().capabilities.valid && device().capabilities.q4_k_cooperative;
+#endif
+    const bool direct_m8 = allow_auto_m8 && wide_option == nullptr && ggml_riscv_accel_auto_enabled() &&
+        !qbs_emulation_enabled() && cooperative && weight_type == GGML_TYPE_Q4_K &&
+        k_elements == 2048 && input_rows % 8 == 0 && output_rows >= 32 && output_rows % 32 == 0 &&
+        ggml_riscv_q8_K_m8::enabled();
+    const qbs_activation_storage_t storage = (direct_m8 || env_true("GGML_RISCV_QBS_WIDE_M"))
         ? qbs_recommend_activation_storage(
               &device(), profile.weight, profile.activation, QBS_WEIGHT_LAYOUT_R4_BLOCK_MAJOR,
               static_cast<size_t>(input_rows), static_cast<size_t>(output_rows), static_cast<size_t>(k_elements))
@@ -1098,6 +1255,16 @@ bool ggml_riscv_qbs_plan_activations(ggml_type                          weight_t
     plan->row_major_bytes = row_major_bytes;
     plan->workspace_bytes = row_major_bytes;
     if (!plan->wide_m) {
+        return true;
+    }
+
+    if (direct_m8) {
+        if (row_major_bytes == std::numeric_limits<size_t>::max()) {
+            *plan = {};
+            return false;
+        }
+        plan->direct_m8 = true;
+        plan->workspace_bytes = row_major_bytes + 1;
         return true;
     }
 
@@ -1115,6 +1282,18 @@ bool ggml_riscv_qbs_plan_activations(ggml_type                          weight_t
     }
     plan->workspace_bytes = plan->row_major_offset + plan->row_major_bytes;
     return true;
+}
+
+bool ggml_riscv_qbs_prepare_m8(const float * input, void * packed, int64_t input_rows,
+                              int64_t k_elements, size_t element_stride, size_t row_stride,
+                              int n_threads, bool m4_lookup, bool context_reuse) {
+    ggml_riscv_q8_K_m8::require_zero_vstart();
+    if (n_threads != 1 || m4_lookup || context_reuse || element_stride != sizeof(float) || k_elements <= 0 ||
+        uint64_t(k_elements) > std::numeric_limits<size_t>::max()/sizeof(float) ||
+        row_stride != static_cast<size_t>(k_elements)*sizeof(float)) {
+        return false;
+    }
+    return ggml_riscv_q8_K_m8::quantize(input, packed, input_rows, k_elements);
 }
 
 int ggml_riscv_qbs_pack_wide_activations(ggml_type    weight_type,
@@ -1264,6 +1443,28 @@ bool ggml_riscv_qbs_supports_tensor(ggml_type type, int64_t k_elements, int64_t 
     return tensor_support_reason(type, k_elements, output_rows) == qbs_support_reason::supported;
 }
 
+unsigned ggml_riscv_qbs_weight_segment_blocks() {
+    // Packed tensors and graph lookahead must use the same immutable policy.
+    static const unsigned segment = []() -> unsigned {
+        const char * value = std::getenv("GGML_RISCV_QBS_SEGMENT_K_BLOCKS");
+        if (!qbs_runtime_enabled() || value == nullptr || *value == '\0') {
+            return 0;
+        }
+        for (const char * digit = value; *digit; ++digit) {
+            if (*digit < '0' || *digit > '9') {
+                GGML_ABORT("Invalid GGML_RISCV_QBS_SEGMENT_K_BLOCKS");
+            }
+        }
+        char * end = nullptr;
+        const unsigned long blocks = std::strtoul(value, &end, 10);
+        if (*end != '\0' || blocks > QBS_MAX_K_BLOCKS || blocks > device().capabilities.max_k_blocks) {
+            GGML_ABORT("Invalid GGML_RISCV_QBS_SEGMENT_K_BLOCKS");
+        }
+        return static_cast<unsigned>(blocks);
+    }();
+    return segment;
+}
+
 void ggml_riscv_qbs_trace_tensor_decision(const void * tensor_identity,
                                           const char * tensor_name,
                                           ggml_type    type,
@@ -1367,7 +1568,8 @@ void ggml_riscv_qbs_trace_activation_lifetime(const void * op_identity,
                                               int64_t      output_rows,
                                               uint64_t     graph_epoch,
                                               bool         quantize_time_valid,
-                                              uint64_t     quantize_time_us) {
+                                              uint64_t     quantize_time_us,
+                                              bool         prepared_cache_active) {
     if (!ggml_riscv_qbs_trace_activation_lifetime_enabled() || quantized_data == nullptr || quantized_bytes == 0) {
         return;
     }
@@ -1381,6 +1583,7 @@ void ggml_riscv_qbs_trace_activation_lifetime(const void * op_identity,
     ensure_activation_trace_registered();
     std::lock_guard<std::mutex> lock(state.mutex);
 
+    state.prepared_cache_active |= prepared_cache_active;
     const uint64_t sequence = ++state.sequence;
     state.graph_epochs.insert(graph_epoch);
     ++state.quantizations;
@@ -1435,8 +1638,8 @@ void ggml_riscv_qbs_trace_activation_lifetime(const void * op_identity,
                  "weight_type=%s weight_profile=%u source=%s activation_type=%s activation_profile=%u "
                  "m=%lld n=%lld k=%lld "
                  "bytes=%zu digest=%016llx match_seq=%llu match_weight=%s "
-                 "same_tensor=%d same_data=%d reusable=%d quantize_time_valid=%d "
-                 "quantize_time_us=%llu op_id=%p weight_id=%p source_id=%p source_data=%p quantized_data=%p\n",
+                 "same_tensor=%d same_data=%d reusable=%d %s=%d "
+                 "%s=%llu op_id=%p weight_id=%p source_id=%p source_data=%p quantized_data=%p\n",
                  static_cast<unsigned long long>(sequence), static_cast<unsigned long long>(graph_epoch),
                  trace_name(op_name).c_str(), trace_name(weight_name).c_str(), ggml_type_name(weight_type),
                  profile_for_type(weight_type).weight, trace_name(source_name).c_str(), ggml_type_name(activation_type),
@@ -1446,7 +1649,9 @@ void ggml_riscv_qbs_trace_activation_lifetime(const void * op_identity,
                  static_cast<unsigned long long>(exact_match ? exact_match->sequence : 0),
                  exact_match ? exact_match->weight_name.c_str() : "-",
                  exact_match && exact_match->source_tensor_identity == source_tensor_identity,
-                 exact_match && exact_match->source_data == source_data, reusable, quantize_time_valid,
+                 exact_match && exact_match->source_data == source_data, reusable,
+                 prepared_cache_active ? "preparation_time_valid" : "quantize_time_valid", quantize_time_valid,
+                 prepared_cache_active ? "preparation_time_us" : "quantize_time_us",
                  static_cast<unsigned long long>(quantize_time_us), op_identity, weight_identity,
                  source_tensor_identity, source_data, quantized_data);
 
@@ -1482,10 +1687,18 @@ int ggml_riscv_qbs_repack_r4(ggml_type    type,
                              const void * src,
                              size_t       src_size,
                              int64_t      output_rows,
-                             int64_t      k_blocks) {
+                             int64_t      k_blocks,
+                             unsigned     segment_k_blocks) {
     const qbs_profile profile = profile_for_type(type);
     if (!dst || !src || output_rows <= 0 || k_blocks <= 0 || profile.weight == QBS_WEIGHT_PROFILE_INVALID) {
         return -1;
+    }
+    if (segment_k_blocks != 0) {
+        if (output_rows > UINT32_MAX) {
+            return -1;
+        }
+        return qbs_repack_weight_r4_segmented(profile.weight, src, src_size, static_cast<size_t>(output_rows),
+                                             static_cast<size_t>(k_blocks), segment_k_blocks, dst, dst_size) == QBS_STATUS_OK ? 0 : -1;
     }
     return qbs_repack_weight_r4(profile.weight, src, src_size, static_cast<size_t>(output_rows),
                                 static_cast<size_t>(k_blocks), dst, dst_size) == QBS_STATUS_OK ?
@@ -1541,7 +1754,10 @@ static void ggml_riscv_qbs_gemm_with_storage(ggml_type    weight_type,
                                              const void * activations,
                                              int          input_rows,
                                              int          output_rows,
-                                             unsigned     activation_storage) {
+                                             unsigned     activation_storage,
+                                             uint32_t     storage_rows = 0,
+                                             uint32_t     row_start = 0,
+                                             unsigned     segment_k_blocks = 0) {
     const qbs_profile profile        = profile_for_type(weight_type);
     const unsigned    block_elements = qbs_weight_block_elements(profile.weight);
     GGML_ASSERT(input_rows > 0 && n > 0 && block_elements != 0 && n % static_cast<int>(block_elements) == 0);
@@ -1555,16 +1771,18 @@ static void ggml_riscv_qbs_gemm_with_storage(ggml_type    weight_type,
         static_cast<uint32_t>(n),
     };
     qbs_plan_t         plan{};
-    const qbs_status_t plan_status = qbs_plan_create(&device(), &problem, &plan);
+    const qbs_status_t plan_status = segment_k_blocks != 0
+        ? qbs_plan_create_segmented_r4_view(&device(), &problem, segment_k_blocks, storage_rows, row_start, &plan)
+        : qbs_plan_create(&device(), &problem, &plan);
     GGML_ASSERT(plan_status == QBS_STATUS_OK);
-    record_operation(weight_type, true, n, input_rows, output_rows, plan.split_k);
+    record_operation(weight_type, input_rows != 1, n, input_rows, output_rows, plan.split_k);
     qbs_workspace_buffer  workspace(plan.workspace_bytes);
     const qbs_activation_trace_link trace_link = linked_activation(activations);
     qbs_execution_context context{
         weight_type, qbs_emulation_enabled(), trace_link.graph_epoch, trace_link.activation_sequence
     };
     const size_t          weight_bytes = qbs_weight_storage_bytes(profile.weight, QBS_WEIGHT_LAYOUT_R4_BLOCK_MAJOR,
-                                                                  static_cast<size_t>(output_rows), plan.k_blocks);
+                                                                  segment_k_blocks != 0 ? storage_rows : static_cast<size_t>(output_rows), plan.k_blocks);
     const size_t activation_bytes = qbs_activation_storage_bytes(
         profile.activation, activation_storage, static_cast<size_t>(input_rows), plan.k_blocks);
     const size_t output_capacity  = static_cast<size_t>(input_rows - 1) * dst_stride + static_cast<size_t>(output_rows);
@@ -1572,6 +1790,18 @@ static void ggml_riscv_qbs_gemm_with_storage(ggml_type    weight_type,
         execute_plan(plan, weights, weight_bytes, activations, activation_bytes, dst, output_capacity, dst_stride,
                      workspace.pointer(), workspace.size_bytes(), &context);
     GGML_ASSERT(status == QBS_STATUS_OK);
+}
+
+void ggml_riscv_qbs_mul_mat_view(ggml_type weight_type, int k, float * dst, size_t dst_stride,
+                               const void * weights, const void * activations,
+                               int input_rows, int output_rows, int64_t storage_rows,
+                               int64_t row_start, unsigned segment_k_blocks, bool wide_m) {
+    GGML_ASSERT(storage_rows > 0 && storage_rows <= UINT32_MAX && row_start >= 0 && row_start <= storage_rows);
+    GGML_ASSERT(output_rows > 0 && output_rows <= storage_rows - row_start && segment_k_blocks != 0);
+    ggml_riscv_qbs_gemm_with_storage(weight_type, k, dst, dst_stride, weights, activations, input_rows, output_rows,
+                                    input_rows == 1 ? QBS_ACTIVATION_STORAGE_ROW_MAJOR :
+                                    wide_m ? QBS_ACTIVATION_STORAGE_M8_GROUPED : QBS_ACTIVATION_STORAGE_M4_GROUPED,
+                                    static_cast<uint32_t>(storage_rows), static_cast<uint32_t>(row_start), segment_k_blocks);
 }
 
 void ggml_riscv_qbs_gemm(ggml_type    weight_type,

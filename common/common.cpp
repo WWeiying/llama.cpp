@@ -293,7 +293,11 @@ void postprocess_cpu_params(common_cpu_params & cpuparams, const common_cpu_para
         if (role_model != nullptr) {
             cpuparams = *role_model;
         } else {
+#if defined(LLAMA_RISCV_ACCEL_DEFAULT_THREADS)
+            cpuparams.n_threads = LLAMA_RISCV_ACCEL_DEFAULT_THREADS;
+#else
             cpuparams.n_threads = common_cpu_get_num_math();
+#endif
         }
     }
 

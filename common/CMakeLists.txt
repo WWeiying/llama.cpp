@@ -126,6 +126,13 @@ set_target_properties(${TARGET} PROPERTIES
     MACHO_CURRENT_VERSION 0 # keep macOS linker from seeing oversized version number
 )
 
+if (GGML_RISCV_ACCEL_AUTO AND (GGML_RISCV_QBS OR GGML_RISCV_AKV))
+    target_compile_definitions(${TARGET} PRIVATE LLAMA_RISCV_ACCEL_DEFAULT_THREADS=1)
+    if (CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
+        target_compile_options(${TARGET} PRIVATE -fno-fast-math -ffp-contract=off)
+    endif()
+endif()
+
 target_include_directories(${TARGET} PUBLIC . ../vendor)
 target_compile_features   (${TARGET} PUBLIC cxx_std_17)
 
