@@ -4,6 +4,28 @@ if (GGML_RISCV_AKV_PROVIDER_SOURCE)
 endif()
 option(GGML_RISCV_AKV_RESIDENT "Trusted-provider resident Decode" ${GGML_AKV_RESIDENT_DEFAULT})
 option(GGML_RISCV_AKV_LINUX_PORTAL "Opt-in kernel-copy Resident Decode portal (cost unmeasured)" OFF)
+option(GGML_RISCV_AKV_LINUX_DIRECT "Linux v4 Direct-U Attention lease (requires matching kernel and RTL gate)" OFF)
+option(GGML_RISCV_AKV_COMPACT_COEFFICIENTS "Resident FP16 probability workspace" OFF)
+set(GGML_RISCV_AKV_DIRECT_CONTRACT_SHA256 "" CACHE STRING "Pinned Direct-U deployment contract SHA256")
+if (GGML_RISCV_AKV_LINUX_DIRECT)
+    string(LENGTH "${GGML_RISCV_AKV_DIRECT_CONTRACT_SHA256}" GGML_AKV_CONTRACT_LENGTH)
+    if (NOT GGML_AKV_CONTRACT_LENGTH EQUAL 64 OR
+        NOT GGML_RISCV_AKV_DIRECT_CONTRACT_SHA256 MATCHES "^[0-9a-fA-F]+$" OR
+        GGML_RISCV_AKV_DIRECT_CONTRACT_SHA256 MATCHES "^0+$")
+        message(FATAL_ERROR "Direct-U requires a pinned 64-digit nonzero deployment contract SHA256")
+    endif()
+    if (NOT GGML_RISCV_AKV OR NOT GGML_RISCV_AKV_RESIDENT OR
+        GGML_RISCV_AKV_LINUX_PORTAL OR GGML_RISCV_AKV_PROVIDER_SOURCE)
+        message(FATAL_ERROR "Direct-U requires AKV and Resident, without a portal or external provider")
+    endif()
+    if (NOT CMAKE_SYSTEM_NAME STREQUAL "Linux" OR NOT GGML_SYSTEM_ARCH STREQUAL "riscv64" OR
+        NOT CMAKE_SIZEOF_VOID_P EQUAL 8 OR BUILD_SHARED_LIBS OR GGML_BACKEND_DL)
+        message(FATAL_ERROR "Direct-U requires a static RV64 Linux build without dynamically loaded backends")
+    endif()
+endif()
+if (GGML_RISCV_AKV_COMPACT_COEFFICIENTS AND NOT GGML_RISCV_AKV_RESIDENT)
+    message(FATAL_ERROR "Compact probabilities require Resident")
+endif()
 function(ggml_add_cpu_backend_features cpu_name arch)
     # The feature detection code is compiled as a separate target so that
     # it can be built without the architecture flags
@@ -564,7 +586,7 @@ function(ggml_add_cpu_backend_variant_impl tag_name)
                     "${GGML_RISCV_AKV_RUNTIME_DIR}/../llama/platform/linux" CACHE PATH
                     "Archived Ara SDK software/llama/platform/linux source directory")
                 get_filename_component(GGML_AKV_LINUX_DIR "${GGML_RISCV_AKV_LINUX_PORTAL_DIR}" ABSOLUTE)
-                foreach(source client.h ara_resident_uapi.h job_layout.h client_v2.c client_rv64.S)
+                foreach(source client.h ara_resident_uapi.h job_layout.h view_uapi.h view_layout.h client_v2.c client_rv64.S)
                     if (NOT EXISTS "${GGML_AKV_LINUX_DIR}/${source}")
                         message(FATAL_ERROR "GGML_RISCV_AKV_LINUX_PORTAL_DIR must contain ${source}")
                     endif()
@@ -590,6 +612,46 @@ function(ggml_add_cpu_backend_variant_impl tag_name)
                     COMPILE_OPTIONS -fno-fast-math -ffp-contract=off -fno-lto)
             endif()
             if (GGML_RISCV_AKV_RESIDENT)
+                if (GGML_RISCV_AKV_LINUX_DIRECT)
+                    set(GGML_RISCV_AKV_LINUX_DIRECT_DIR
+                        "${GGML_RISCV_AKV_RUNTIME_DIR}/../llama/platform/linux/direct" CACHE PATH
+                        "Pinned Linux v4 Direct-U client source directory")
+                    foreach(source direct_client.c direct_client.h direct_uapi.h)
+                        if (NOT EXISTS "${GGML_RISCV_AKV_LINUX_DIRECT_DIR}/${source}")
+                            message(FATAL_ERROR "Direct-U client missing ${source}")
+                        endif()
+                    endforeach()
+                    target_compile_definitions(${GGML_CPU_NAME} PRIVATE GGML_USE_RISCV_AKV_LINUX_DIRECT)
+                    set_property(SOURCE ggml-cpu/arch/riscv/linux-direct.cpp APPEND PROPERTY
+                        COMPILE_DEFINITIONS GGML_AKV_DIRECT_CONTRACT_SHA256="${GGML_RISCV_AKV_DIRECT_CONTRACT_SHA256}")
+                    target_include_directories(${GGML_CPU_NAME} PRIVATE "${GGML_RISCV_AKV_LINUX_DIRECT_DIR}")
+                    list(APPEND GGML_CPU_SOURCES ggml-cpu/arch/riscv/linux-direct.cpp
+                        "${GGML_RISCV_AKV_LINUX_DIRECT_DIR}/direct_client.c")
+                    set_property(SOURCE "${GGML_RISCV_AKV_LINUX_DIRECT_DIR}/direct_client.c"
+                        APPEND PROPERTY COMPILE_OPTIONS -march=rv64gc -mabi=lp64d
+                        -ffreestanding -fno-builtin -fno-stack-protector -fno-lto)
+                    set_property(SOURCE ggml-cpu/arch/riscv/linux-direct.cpp APPEND PROPERTY
+                        COMPILE_OPTIONS -fno-fast-math -ffp-contract=off -fno-lto)
+                    if (CMAKE_C_COMPILER_ID STREQUAL "GNU" AND CMAKE_CXX_COMPILER_ID STREQUAL "GNU")
+                        set_property(SOURCE ggml-cpu/arch/riscv/linux-direct.cpp
+                            "${GGML_RISCV_AKV_LINUX_DIRECT_DIR}/direct_client.c" APPEND PROPERTY
+                            COMPILE_OPTIONS -fno-tree-vectorize -fno-tree-slp-vectorize)
+                    elseif (CMAKE_C_COMPILER_ID MATCHES "Clang" AND CMAKE_CXX_COMPILER_ID MATCHES "Clang")
+                        set_property(SOURCE ggml-cpu/arch/riscv/linux-direct.cpp
+                            "${GGML_RISCV_AKV_LINUX_DIRECT_DIR}/direct_client.c" APPEND PROPERTY
+                            COMPILE_OPTIONS -fno-vectorize -fno-slp-vectorize)
+                    else()
+                        message(FATAL_ERROR "Direct-U requires reviewed scalar compiler flags")
+                    endif()
+                endif()
+                if (GGML_RISCV_AKV_COMPACT_COEFFICIENTS)
+                    if (NOT EXISTS "${GGML_RISCV_AKV_RUNTIME_DIR}/experimental/resident_attention/pv_compact.S")
+                        message(FATAL_ERROR "Compact probabilities require the matching SDK")
+                    endif()
+                    target_compile_definitions(${GGML_CPU_NAME} PRIVATE AKV_RESIDENT_COMPACT_COEFFICIENTS=1)
+                    list(APPEND GGML_CPU_SOURCES
+                        ${GGML_RISCV_AKV_RUNTIME_DIR}/experimental/resident_attention/pv_compact.S)
+                endif()
                 if (GGML_RISCV_AKV_PROVIDER_SOURCE)
                     if (NOT EXISTS "${GGML_RISCV_AKV_PROVIDER_SOURCE}")
                         message(FATAL_ERROR "GGML_RISCV_AKV_PROVIDER_SOURCE does not exist")

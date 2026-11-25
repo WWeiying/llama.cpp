@@ -8,6 +8,13 @@ struct resident_group_v1 {
     int64_t first_head;
 };
 
+#ifdef GGML_USE_RISCV_AKV_LINUX_DIRECT
+static_assert(sizeof(akv_attention_v2_prefill_workspace_t)+sizeof(akv_attention_v2_workspace_t)+
+              sizeof(resident_group_v1)+128*1024 < ggml_akv_direct::stack_reserve_bytes,
+              "Direct-U stack prefault budget must track SDK workspace growth");
+static std::vector<resident_group_v1> direct_groups;
+#endif
+
 struct resident_counts_v1 {
     std::atomic<uint64_t> denied{}, unsupported{}, lease_denied{}, resident_calls{}, native_calls{};
     std::atomic<uint64_t> resident_groups{}, native_groups{}, completed{}, failed{};
@@ -82,17 +89,30 @@ static bool stage5_native(const ggml_compute_params *params, ggml_tensor *dst,
 #if defined(AKV_NATIVE_AUTO_PAIR_POLICY) && AKV_NATIVE_AUTO_PAIR_POLICY
     automatic=std::getenv("AKV_PAIR_HEADS")==nullptr;
 #endif
-    const bool requested=ggml_riscv_accel_resident_requested(dim,rows,unsigned(active));
+    bool requested=ggml_riscv_accel_resident_requested(dim,rows,unsigned(active));
+#ifdef GGML_USE_RISCV_AKV_LINUX_DIRECT
+    const auto &caps=device().capabilities;
+    requested=requested && caps.resident_valid && caps.resident_capability_version==1 &&
+        caps.resident_qk_supported && caps.resident_pv_supported &&
+        caps.resident_nr_lanes==4 && caps.resident_vlen_bits==1024;
+#endif
     const ggml_tensor *q=dst->src[0],*k=dst->src[1],*v=dst->src[2],*mask=dst->src[3];
     const uint32_t limit=portable ? device().capabilities.max_q_rows : rows;
     const size_t per_kv=(rows+limit-1)/limit;
     size_t count;
     if (__builtin_mul_overflow(per_kv,size_t(k->ne[2]),&count) || !count || count>UINT32_MAX ||
         count>std::numeric_limits<size_t>::max()/sizeof(resident_group_v1)) return stage5_decline();
+#ifdef GGML_USE_RISCV_AKV_LINUX_DIRECT
+    if (ggml_akv_direct::active() && direct_groups.size()<count) return stage5_decline();
+    // Emulation does not hold a kernel lease and can resize normally.
+    if (direct_groups.size()<count) direct_groups.resize(count);
+    auto &groups=direct_groups;
+#else
     std::vector<resident_group_v1> groups(count);
+#endif
     akv_platform_span_v1 spans[7]={{q->data,ggml_nbytes(q),0},{k->data,ggml_nbytes(k),0},
         {v->data,ggml_nbytes(v),0},{mask->data,ggml_nbytes(mask),0},
-        {dst->data,ggml_nbytes(dst),1},{groups.data(),groups.size()*sizeof(groups[0]),1}};
+        {dst->data,ggml_nbytes(dst),1},{groups.data(),count*sizeof(groups[0]),1}};
     size_t span_count=6;
     if (dst->src[4]) spans[span_count++]={dst->src[4]->data,ggml_nbytes(dst->src[4]),0};
     // Writable output must not alias any input, nor the private query/workspace.
@@ -155,7 +175,8 @@ static bool stage5_native(const ggml_compute_params *params, ggml_tensor *dst,
         GGML_ABORT("AKV platform whole-call start failed");
     (shared?resident_counts.resident_calls:resident_counts.native_calls).fetch_add(1,std::memory_order_relaxed);
     const ggml_from_float_t convert=ggml_get_type_traits_cpu(GGML_TYPE_F16)->from_float;
-    for (auto &g:groups) {
+    for (size_t i=0;i<count;++i) {
+        auto &g=groups[i];
         for (uint32_t h=0;h<g.plan.descriptor.q_rows;++h) {
             const float *source=reinterpret_cast<const float *>(static_cast<const char *>(q->data)+(g.first_head+h)*q->nb[2]);
             convert(source,g.query.data()+h*dim,dim);
@@ -181,8 +202,66 @@ static bool stage5_native(const ggml_compute_params *params, ggml_tensor *dst,
         trace.groups_v2.fetch_add(count,std::memory_order_relaxed);
         trace.kv_group_tokens.fetch_add(count*active,std::memory_order_relaxed);
         trace.attention_macs.fetch_add(UINT64_C(2)*k->ne[2]*active*rows*dim,std::memory_order_relaxed);
-        std::fprintf(stderr,"GGML_RISCV_AKV_RESIDENT_V1 route=%s requested=%u groups=%zu dimension=%u tokens=%d\n",
+        if (trace_output_allowed()) std::fprintf(stderr,"GGML_RISCV_AKV_RESIDENT_V1 route=%s requested=%u groups=%zu dimension=%u tokens=%d\n",
             shared?"resident":"native",unsigned(requested),count,dim,active);
     }
     return true;
 }
+
+#ifdef GGML_USE_RISCV_AKV_LINUX_DIRECT
+static bool stage5_direct(const ggml_compute_params *params,ggml_tensor *dst) {
+    if (!runtime_enabled() || params->nth!=1 || params->ith!=0 || params->use_ref ||
+        !dst->src[0] || !dst->src[1] || !dst->src[2] || !dst->src[3]) return stage5_decline();
+    static std::mutex call_mutex;
+    std::lock_guard<std::mutex> call_lock(call_mutex);
+    const ggml_tensor *q=dst->src[0],*k=dst->src[1];
+#ifdef GGML_USE_RISCV_QUANT_KV
+    if (k->type==GGML_TYPE_Q4_0 || k->type==GGML_TYPE_Q8_0) {
+        if (!env_true("GGML_RISCV_AKV_QUANT_KV")) return stage5_decline();
+        std::lock_guard<std::mutex> lock(context_mutex());
+        const auto status=ggml_riscv_quant_kv_flash_attn(params,dst);
+        if (status==ggml_riscv_quant_kv_status::failed)
+            GGML_ABORT("Quantized KV Attention failed after admission");
+        return status==ggml_riscv_quant_kv_status::complete;
+    }
+#endif
+    if (q->type!=GGML_TYPE_F32 || k->type!=GGML_TYPE_F16 || dst->src[2]->type!=GGML_TYPE_F16 ||
+        q->ne[1]<=0 || q->ne[2]<=0 || q->ne[2]>4096) return stage5_decline();
+    if (!ggml_akv_direct::available()) {
+        register_trace();
+        resident_counts.lease_denied.fetch_add(1,std::memory_order_relaxed);
+        return false;
+    }
+    // Prepare all heap allocations and lazy helpers before opening the gate.
+    if (q->ne[1]==1 && direct_groups.size()<size_t(q->ne[2])) {
+        try { direct_groups.resize(size_t(q->ne[2])); }
+        catch (const std::bad_alloc &) { return stage5_decline(); }
+    }
+    register_trace();
+    (void)context_mutex();
+    (void)ggml_get_type_traits_cpu(GGML_TYPE_F16);
+    ggml_akv_direct::span spans[7];size_t n=0;
+    for (unsigned i=0;i<5;++i) {
+        const ggml_tensor *t=dst->src[i];
+        if (t) spans[n++]={t->data,ggml_nbytes(t),false};
+    }
+    spans[n++]={dst->data,ggml_nbytes(dst),true};
+    if (!direct_groups.empty()) spans[n++]={direct_groups.data(),direct_groups.size()*sizeof(direct_groups[0]),true};
+    if (!ggml_akv_direct::prepare(spans,n) || !ggml_akv_direct::begin()) {
+        resident_counts.lease_denied.fetch_add(1,std::memory_order_relaxed);
+        return false;
+    }
+    const auto *p=ggml_akv_direct::provider();
+    const auto gate=ggml_akv_platform_entry_v1(p);
+    const auto previous=resident_counts.resident_groups.load(std::memory_order_relaxed);
+    const bool complete=gate==AKV_PLATFORM_READY && stage5_native(params,dst,p);
+    if (!ggml_akv_direct::end()) GGML_ABORT("Direct-U Attention release failed; cannot retry");
+    if (gate<0) GGML_ABORT("Direct-U Attention state violation: %d",int(gate));
+    if (env_true("GGML_RISCV_AKV_TRACE")) {
+        std::fprintf(stderr,"GGML_AKV_DIRECT complete=%u query_tokens=%lld kv_capacity=%lld resident_groups=%llu\n",
+            unsigned(complete),(long long)q->ne[1],(long long)k->ne[1],
+            (unsigned long long)(resident_counts.resident_groups.load(std::memory_order_relaxed)-previous));
+    }
+    return complete;
+}
+#endif

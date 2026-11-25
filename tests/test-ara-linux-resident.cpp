@@ -73,6 +73,7 @@ struct mock_state {
     unsigned first = 0;
     bool live = false;
     fixture * f = nullptr;
+    uintptr_t last_query = 0, last_output = 0;
 } mock;
 
 static void reset(fixture & f) {
@@ -82,12 +83,14 @@ static void reset(fixture & f) {
     setenv("GGML_RISCV_AKV", "1", 1);
     unsetenv("GGML_RISCV_AKV_EMULATE");
     unsetenv("GGML_RISCV_AKV_LINUX_PORTAL");
+    unsetenv("GGML_RISCV_AKV_LINUX_SESSION");
     unsetenv("GGML_RISCV_AKV_TRACE");
 }
 
 namespace ggml_akv_linux {
 int test_read_state() {
-    assert(mock.live && mock.infos == 1 && !mock.executes && !mock.conversions);
+    const bool session = ggml_riscv_accel_true(std::getenv("GGML_RISCV_AKV_LINUX_SESSION"));
+    assert((session || (mock.live && mock.infos == 1)) && !mock.executes && !mock.conversions);
     ++mock.reads;
     return mock.state_error;
 }
@@ -164,6 +167,11 @@ extern "C" long ara_resident_test_syscall(long nr, long a, long b, long c) {
     const auto * key = reinterpret_cast<const ggml_fp16_t *>(uintptr_t(job.key));
     const auto * value = reinterpret_cast<const ggml_fp16_t *>(uintptr_t(job.value));
     const auto * mask = reinterpret_cast<const ggml_fp16_t *>(uintptr_t(job.mask));
+    if (f.k.nb[1] == f.dim * 2) assert(key == f.keys.data() + kv * f.k.nb[2] / 2);
+    if (f.v.nb[1] == f.dim * 2) assert(value == f.values.data() + kv * f.v.nb[2] / 2);
+    assert(mask == f.masks.data());
+    mock.last_query = job.query;
+    mock.last_output = job.output;
     for (unsigned h = 0; h < job.heads; ++h) {
         for (unsigned x = 0; x < f.dim; ++x) {
             assert(query[h * f.dim + x] == ggml_compute_fp32_to_fp16(f.queries[(mock.first + h) * (f.dim + 8) + x]));
@@ -198,7 +206,11 @@ using ggml_akv_linux::result;
 
 static result run(fixture & f) {
     const auto r = ggml_akv_linux::try_flash_attn(&f.params, &f.dst);
-    assert(!mock.live);
+    if (ggml_riscv_accel_true(std::getenv("GGML_RISCV_AKV_LINUX_SESSION"))) {
+        assert(mock.live == (ggml_akv_linux::thread_session().fd >= 0));
+    } else {
+        assert(!mock.live);
+    }
     return r;
 }
 

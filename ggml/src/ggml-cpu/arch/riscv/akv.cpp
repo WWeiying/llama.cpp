@@ -29,6 +29,9 @@
 #include <vector>
 #include "entry.h"
 #include "resident_attention/executor.h"
+#ifdef GGML_USE_RISCV_AKV_LINUX_DIRECT
+#include "linux-direct.h"
+#endif
 static bool stage5_legacy_body(const ggml_compute_params *,ggml_tensor *);
 #endif
 #line 24
@@ -93,6 +96,14 @@ static bool emulation_enabled() {
 
 static bool runtime_enabled() {
     return env_true("GGML_RISCV_AKV") || emulation_enabled();
+}
+
+static bool trace_output_allowed() {
+#ifdef GGML_USE_RISCV_AKV_LINUX_DIRECT
+    return !ggml_akv_direct::active();
+#else
+    return true;
+#endif
 }
 
 static bool portable_decode_selected(uint32_t kernel_version, uint32_t q_rows,
@@ -198,6 +209,24 @@ static void report_trace() {
                  static_cast<unsigned long long>(trace.fallback[5].load()),
                  static_cast<unsigned long long>(trace.fallback[6].load()),
                  static_cast<unsigned long long>(trace.fallback[7].load()));
+#ifdef GGML_USE_RISCV_AKV_LINUX_DIRECT
+    ggml_akv_resident_counters_v1 counts{};
+    ggml_akv_resident_snapshot_v1(&counts);
+    std::fprintf(stderr,"GGML_AKV_DIRECT_COVERAGE lease_denied=%llu resident_calls=%llu native_calls=%llu "
+        "resident_groups=%llu native_groups=%llu legacy_completed=%llu failed=%llu\n",
+        (unsigned long long)counts.lease_denied,(unsigned long long)counts.resident_calls,
+        (unsigned long long)counts.native_calls,(unsigned long long)counts.resident_groups,
+        (unsigned long long)counts.native_groups,(unsigned long long)counts.legacy_completed,
+        (unsigned long long)counts.failed);
+    const auto prep=ggml_akv_direct::stats();
+    const char *error=ggml_akv_direct::last_error();
+    std::fprintf(stderr,"GGML_AKV_DIRECT_PREP prepares=%llu maps=%llu smaps=%llu cache_hits=%llu "
+        "mlock=%llu acquire_attempts=%llu releases=%llu last_error=%s\n",
+        (unsigned long long)prep.prepares,(unsigned long long)prep.maps_reads,
+        (unsigned long long)prep.smaps_reads,(unsigned long long)prep.cache_hits,
+        (unsigned long long)prep.lock_calls,(unsigned long long)prep.acquires,
+        (unsigned long long)prep.releases,error?error:"none");
+#endif
 }
 
 static void register_trace() {
@@ -751,6 +780,9 @@ extern "C" void ggml_akv_resident_snapshot_v1(ggml_akv_resident_counters_v1 *out
 #line 710
 #if defined(GGML_AKV_RESIDENT) && GGML_AKV_RESIDENT
 bool ggml_riscv_akv_flash_attn(const ggml_compute_params * params, ggml_tensor * dst) {
+#ifdef GGML_USE_RISCV_AKV_LINUX_DIRECT
+    if (!emulation_enabled()) return stage5_direct(params, dst);
+#endif
 #ifdef GGML_USE_RISCV_AKV_LINUX_PORTAL
     if (ggml_akv_linux::flash_attn(params, dst)) return true;
 #endif
@@ -812,10 +844,10 @@ bool ggml_riscv_akv_flash_attn(const ggml_compute_params * params, ggml_tensor *
             trace.fallback[fallback_index(reason)].fetch_add(1, std::memory_order_relaxed);
             static const char * names[] = {"supported", "runtime", "capability", "threading",
                                            "feature", "shape", "layout", "mask", "size"};
-            std::fprintf(stderr, "GGML_RISCV_AKV_FALLBACK mode=%s reason=%s portable=%d\n",
+            if (trace_output_allowed()) std::fprintf(stderr, "GGML_RISCV_AKV_FALLBACK mode=%s reason=%s portable=%d\n",
                          dst->src[0] && dst->src[0]->ne[1] == 1 ? "decode" : "prefill",
                          names[static_cast<size_t>(reason)], portable);
-            if (is_prefill && reason == support_reason::layout) {
+            if (trace_output_allowed() && is_prefill && reason == support_reason::layout) {
                 report_prefill_layout_once(dst);
             }
         }
@@ -889,7 +921,7 @@ bool ggml_riscv_akv_flash_attn(const ggml_compute_params * params, ggml_tensor *
             trace.attention_macs.fetch_add(attention_macs, std::memory_order_relaxed);
             trace.prefill_query_tokens.fetch_add(static_cast<uint64_t>(q->ne[1]), std::memory_order_relaxed);
             trace.prefill_attention_pairs.fetch_add(all_head_pairs, std::memory_order_relaxed);
-            std::fprintf(stderr,
+            if (trace_output_allowed()) std::fprintf(stderr,
                          "GGML_RISCV_AKV_EXEC mode=prefill kernel=v2 M=%llu P=%d kv_capacity=%llu "
                          "kv_heads=%llu q_heads=%llu q_rows=%u head_dim=%u groups=%llu attention_pairs=%llu "
                          "attention_macs=%llu\n",
@@ -985,7 +1017,7 @@ bool ggml_riscv_akv_flash_attn(const ggml_compute_params * params, ggml_tensor *
             trace.executed_v1.fetch_add(1, std::memory_order_relaxed);
             trace.groups_v1.fetch_add(groups, std::memory_order_relaxed);
         }
-        std::fprintf(stderr,
+        if (trace_output_allowed()) std::fprintf(stderr,
                      "GGML_RISCV_AKV_EXEC mode=decode kernel=v%u kv_heads=%llu q_rows=%llu gqa_rows=%u head_dim=%u "
                      "active_kv=%d attention_macs=%llu groups=%llu portable=%d softcap=%g max_bias=%g sinks=%d\n",
                      kernel_version,

@@ -34,7 +34,7 @@ static bool dump_logits(
 
 static void print_usage(int, char ** argv) {
     printf("\nexample usage:\n");
-    printf("\n    %s -m model.gguf [-n n_predict] [-ngl n_gpu_layers] [-t n_threads] [prompt]\n", argv[0]);
+    printf("\n    %s -m model.gguf [-n n_predict] [-ngl n_gpu_layers] [-t n_threads] [-fa auto|on|off] [--kv-type f16|q8_0|q4_0] [prompt]\n", argv[0]);
     printf("\n");
 }
 
@@ -51,6 +51,8 @@ int main(int argc, char ** argv) {
     int n_predict = 32;
     // number of CPU threads; zero keeps the llama.cpp default
     int n_threads = 0;
+    llama_flash_attn_type flash_attn = LLAMA_FLASH_ATTN_TYPE_AUTO;
+    ggml_type kv_type = GGML_TYPE_F16;
 
     // parse command line arguments
 
@@ -104,6 +106,18 @@ int main(int argc, char ** argv) {
                     print_usage(argc, argv);
                     return 1;
                 }
+            } else if (strcmp(argv[i], "-fa") == 0) {
+                if (++i >= argc) { print_usage(argc, argv); return 1; }
+                if (!strcmp(argv[i], "on")) flash_attn = LLAMA_FLASH_ATTN_TYPE_ENABLED;
+                else if (!strcmp(argv[i], "off")) flash_attn = LLAMA_FLASH_ATTN_TYPE_DISABLED;
+                else if (!strcmp(argv[i], "auto")) flash_attn = LLAMA_FLASH_ATTN_TYPE_AUTO;
+                else { print_usage(argc, argv); return 1; }
+            } else if (strcmp(argv[i], "--kv-type") == 0) {
+                if (++i >= argc) { print_usage(argc, argv); return 1; }
+                if (!strcmp(argv[i], "f16")) kv_type = GGML_TYPE_F16;
+                else if (!strcmp(argv[i], "q8_0")) kv_type = GGML_TYPE_Q8_0;
+                else if (!strcmp(argv[i], "q4_0")) kv_type = GGML_TYPE_Q4_0;
+                else { print_usage(argc, argv); return 1; }
             } else {
                 // prompt starts here
                 break;
@@ -166,6 +180,9 @@ int main(int argc, char ** argv) {
     // initialize the context
 
     llama_context_params ctx_params = llama_context_default_params();
+    ctx_params.flash_attn_type = flash_attn;
+    ctx_params.type_k = kv_type;
+    ctx_params.type_v = kv_type;
     // n_ctx is the context size
     ctx_params.n_ctx = teacher_force ? n_prompt : n_prompt + n_predict - 1;
     // n_batch is the maximum number of tokens that can be processed in a single call to llama_decode
